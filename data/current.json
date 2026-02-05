@@ -4042,7 +4042,7 @@
       "queue_key": "6.1",
       "date": "05.02.2026",
       "span": "11:00-11:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4050,7 +4050,7 @@
       "queue_key": "6.1",
       "date": "05.02.2026",
       "span": "11:30-12:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4412,7 +4412,7 @@
       "queue_key": "6.2",
       "date": "05.02.2026",
       "span": "10:00-10:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4420,7 +4420,7 @@
       "queue_key": "6.2",
       "date": "05.02.2026",
       "span": "10:30-11:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
