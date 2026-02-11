@@ -3752,7 +3752,7 @@
       "queue_key": "5.2",
       "date": "11.02.2026",
       "span": "17:00-17:30",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 5,
@@ -3760,7 +3760,7 @@
       "queue_key": "5.2",
       "date": "11.02.2026",
       "span": "17:30-18:00",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 5,
