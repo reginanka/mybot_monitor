@@ -1268,7 +1268,7 @@
       "queue_key": "2.2",
       "date": "13.02.2026",
       "span": "06:30-07:00",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 2,
@@ -2820,7 +2820,7 @@
       "queue_key": "4.2",
       "date": "13.02.2026",
       "span": "07:00-07:30",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 4,
@@ -2828,7 +2828,7 @@
       "queue_key": "4.2",
       "date": "13.02.2026",
       "span": "07:30-08:00",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 4,
