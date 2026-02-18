@@ -326,7 +326,7 @@
       "queue_key": "1.1",
       "date": "18.02.2026",
       "span": "20:00-20:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 1,
@@ -334,7 +334,7 @@
       "queue_key": "1.1",
       "date": "18.02.2026",
       "span": "20:30-21:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 1,
@@ -342,7 +342,7 @@
       "queue_key": "1.1",
       "date": "18.02.2026",
       "span": "21:00-21:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 1,
@@ -350,7 +350,7 @@
       "queue_key": "1.1",
       "date": "18.02.2026",
       "span": "21:30-22:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 1,
@@ -4218,7 +4218,7 @@
       "queue_key": "6.1",
       "date": "18.02.2026",
       "span": "22:00-22:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4226,7 +4226,7 @@
       "queue_key": "6.1",
       "date": "18.02.2026",
       "span": "22:30-23:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4234,7 +4234,7 @@
       "queue_key": "6.1",
       "date": "18.02.2026",
       "span": "23:00-23:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4242,7 +4242,7 @@
       "queue_key": "6.1",
       "date": "18.02.2026",
       "span": "23:30-24:00",
-      "color": "white"
+      "color": "red"
     }
   ],
   "6.2": [
@@ -4604,7 +4604,7 @@
       "queue_key": "6.2",
       "date": "18.02.2026",
       "span": "22:00-22:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4612,7 +4612,7 @@
       "queue_key": "6.2",
       "date": "18.02.2026",
       "span": "22:30-23:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4620,7 +4620,7 @@
       "queue_key": "6.2",
       "date": "18.02.2026",
       "span": "23:00-23:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4628,7 +4628,7 @@
       "queue_key": "6.2",
       "date": "18.02.2026",
       "span": "23:30-24:00",
-      "color": "white"
+      "color": "red"
     }
   ]
 }
