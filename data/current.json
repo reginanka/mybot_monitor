@@ -1356,7 +1356,7 @@
       "queue_key": "2.2",
       "date": "26.02.2026",
       "span": "12:00-12:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -1364,7 +1364,7 @@
       "queue_key": "2.2",
       "date": "26.02.2026",
       "span": "12:30-13:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -1372,7 +1372,7 @@
       "queue_key": "2.2",
       "date": "26.02.2026",
       "span": "13:00-13:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -3270,7 +3270,7 @@
       "queue_key": "5.1",
       "date": "26.02.2026",
       "span": "11:00-11:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 5,
@@ -3278,7 +3278,7 @@
       "queue_key": "5.1",
       "date": "26.02.2026",
       "span": "11:30-12:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 5,
@@ -3656,7 +3656,7 @@
       "queue_key": "5.2",
       "date": "26.02.2026",
       "span": "11:00-11:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 5,
@@ -3664,7 +3664,7 @@
       "queue_key": "5.2",
       "date": "26.02.2026",
       "span": "11:30-12:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 5,
@@ -4058,7 +4058,7 @@
       "queue_key": "6.1",
       "date": "26.02.2026",
       "span": "12:00-12:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4066,7 +4066,7 @@
       "queue_key": "6.1",
       "date": "26.02.2026",
       "span": "12:30-13:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4444,7 +4444,7 @@
       "queue_key": "6.2",
       "date": "26.02.2026",
       "span": "12:00-12:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4452,7 +4452,7 @@
       "queue_key": "6.2",
       "date": "26.02.2026",
       "span": "12:30-13:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
