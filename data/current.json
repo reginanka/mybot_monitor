@@ -4138,7 +4138,7 @@
       "queue_key": "6.1",
       "date": "12.03.2026",
       "span": "17:00-17:30",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 6,
@@ -4524,7 +4524,7 @@
       "queue_key": "6.2",
       "date": "12.03.2026",
       "span": "17:00-17:30",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 6,
