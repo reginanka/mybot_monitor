@@ -10,6 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          URL: ${{ secrets.URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+          SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
 
     steps:
       - name: Checkout repository
@@ -27,14 +35,7 @@ jobs:
           python -m playwright install chromium --with-deps
 
       - name: Run monitoring script
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
-          URL: ${{ secrets.URL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-          TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
-          SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
+        
         run: python monitor.py
 
       - name: Commit changes
