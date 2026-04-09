@@ -28,6 +28,7 @@ jobs:
 
       - name: Run monitoring script
         env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
           API_BASE_URL: ${{ secrets.API_BASE_URL }}
           URL: ${{ secrets.URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
