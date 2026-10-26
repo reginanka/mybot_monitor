@@ -3,6 +3,12 @@ name: Monitor Schedule Updates
 on:
   workflow_dispatch:
 
+# Зовнішній cron може тригерити, поки попередній ще біжить —
+# другий run чекає (не паралельно → немає дублів у канал)
+concurrency:
+  group: monitor-schedule-updates
+  cancel-in-progress: false
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
