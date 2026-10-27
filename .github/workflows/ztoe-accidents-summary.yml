@@ -2,8 +2,6 @@ name: ZTOE accidents summary (hourly)
 
 on:
   schedule:
-    # кожну годину о :05 (UTC)
-    - cron: "5 * * * *"
   workflow_dispatch:
 
 concurrency:
