@@ -25,7 +25,6 @@ def fetch_site_update_and_screenshot() -> Tuple[Optional[str], Optional[str], Op
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(viewport={"width": 1920, "height": 3080})
-            # Швидше за networkidle: domcontentloaded + коротка пауза
             page.goto(URL, wait_until="domcontentloaded", timeout=25000)
             page.wait_for_timeout(1500)
 

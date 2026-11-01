@@ -332,10 +332,55 @@ def main() -> None:
             return
         save_state(current)
         log_to_buffer("✅ Сповіщення надіслано, стан збережено")
+
+        # DM підписникам бота: той самий текст + картинка, як у канал
+        try:
+            from bot_notify import collect_notify_targets
+            from telegram_handler import send_photos_sync
+            import os
+
+            from bot_notify import is_quiet_now, load_notify_users
+            targets = collect_notify_targets(None, kind="ukrenergo")
+            bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+            if not targets:
+                log_to_buffer("ℹ️ Немає підписників бота для DM статусу")
+            elif not bot_token:
+                log_to_buffer("⚠️ Немає ZTOE_BOT_TOKEN — DM статусу не шлю")
+            else:
+                images: list = []
+                if image_path and Path(image_path).exists():
+                    images = [Path(image_path).read_bytes()]
+                users_by_tid = {
+                    int(u["telegram_id"]): u
+                    for u in load_notify_users("ukrenergo")
+                    if u.get("telegram_id") is not None
+                }
+                sent = 0
+                sent_quiet = 0
+                sent_sound = 0
+                for tid in targets.keys():
+                    silent = is_quiet_now(users_by_tid.get(int(tid)))
+                    if send_photos_sync(
+                        tid, images, message, bot_token=bot_token,
+                        disable_notification=silent,
+                    ):
+                        sent += 1
+                        if silent:
+                            sent_quiet += 1
+                        else:
+                            sent_sound += 1
+                log_to_buffer(
+                    f"📬 DM статусу Укренерго: sent={sent}/{len(targets)}"
+                    f" (🔊={sent_sound} 🔇={sent_quiet})"
+                    f"{' +img' if images else ''}"
+                )
+        except Exception as e:
+            log_to_buffer(f"⚠️ DM статусу після зміни: {e}")
     except Exception as e:
         log_to_buffer(f"❌ Критична помилка Укренерго: {e}")
     finally:
-        send_log_to_channel("📊 ЛОГ ВИКОНАННЯ СКРИПТА · УКРЕНЕРГО")
+        # 152 — гілка «Укренерго2 крон» (обидва Укренерго)
+        send_log_to_channel("📊 ЛОГ ВИКОНАННЯ СКРИПТА · УКРЕНЕРГО", message_thread_id=152)
 
 
 if __name__ == "__main__":

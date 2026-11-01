@@ -3,7 +3,7 @@ import json
 import hashlib
 import shutil
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import requests
@@ -525,6 +525,282 @@ def send_notification_safe(message: str, img_path=None) -> bool:
     return send_notification(message, img_path)
 
 
+
+def normalize_date_key(date_str: str) -> str:
+    """YYYY-MM-DD / DD.MM.YYYY / DD.MM.YY → YYYY-MM-DD для порівняння."""
+    s = (date_str or "").strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return s
+
+
+def dates_equal(a: str, b: str) -> bool:
+    na, nb = normalize_date_key(a), normalize_date_key(b)
+    return bool(na) and na == nb
+
+
+def records_to_slots_for_date(records: List[Dict], date: str) -> List[Dict]:
+    """Червоні інтервали за дату → [{from, to, type}] (сусідні злиті через group_spans).
+
+    date у current.json часто як DD.MM.YYYY, а today у sync — YYYY-MM-DD.
+    Порівнюємо через normalize_date_key.
+    """
+    outages = [
+        r for r in (records or [])
+        if dates_equal(r.get("date") or "", date)
+        and (r.get("color") or "").strip().lower() == "red"
+    ]
+    if not outages:
+        return []
+    grouped = group_spans(
+        [{"span": o["span"], "change": "added"} for o in outages]
+    )
+    slots: List[Dict] = []
+    for g in grouped:
+        start = g.get("start") or ""
+        end = g.get("end") or ""
+        if start and end:
+            slots.append({"from": start, "to": end, "type": "schedule"})
+    return slots
+
+
+def _queue_parts(queue_key: str) -> Tuple[str, str]:
+    parts = (queue_key or "").split(".")
+    if len(parts) != 2:
+        return (queue_key or "").strip(), ""
+    return parts[0].strip(), parts[1].strip()
+
+
+def addr_matches_queue(addr: dict, queue_key: str) -> bool:
+    """Чи адреса користувача належить до черги 4.2 / queue=4 subqueue=2."""
+    q = (addr.get("queue") or "").strip()
+    sq = (addr.get("subqueue") or "").strip()
+    if not q:
+        return False
+    ch, pid = _queue_parts(queue_key)
+    variants = {
+        queue_key,
+        f"{ch}.{pid}" if pid else ch,
+        f"{ch}|{pid}" if pid else ch,
+        ch,
+    }
+    if q in variants:
+        if not sq or not pid:
+            return True
+        return sq == pid or sq == queue_key
+    if sq and f"{q}.{sq}" == queue_key:
+        return True
+    if sq and f"{q}|{sq}" == queue_key:
+        return True
+    return False
+
+
+def _dates_in_records(records: List[Dict]) -> List[str]:
+    """Унікальні дати з records → YYYY-MM-DD, відсортовані."""
+    found = set()
+    for r in records or []:
+        nk = normalize_date_key(r.get("date") or "")
+        if nk:
+            found.add(nk)
+    return sorted(found)
+
+
+def sync_schedules_to_mongo(
+    norm_by_queue: Dict[str, List[Dict]],
+    queue_keys: Optional[List[str]] = None,
+) -> None:
+    """
+    Пише слоти у Mongo (queue_schedules).
+
+    Важливо: при будь-якому diff / зміні набору дат треба оновлювати
+    УСІ черги з current.json, інакше в Mongo лишається старий date
+    (напр. 27.10) і /check показує «світло весь день» за вчорашній день,
+    хоча скрін і API вже на 28.10.
+
+    date / slots беруться з реальних дат у records (current.json),
+    а не лише з «сьогодні по годиннику раннера».
+    """
+    mongo_uri = os.getenv("MONGO_URI")
+    if not mongo_uri:
+        log_to_buffer("⚠️ MONGO_URI не задано — пропуск запису графіків у БД")
+        return
+
+    try:
+        from mongo_store import upsert_queue_schedule
+    except Exception as e:
+        log_to_buffer(f"⚠️ Не вдалося імпортувати mongo_store: {e}")
+        return
+
+    # None або порожній список → усі черги з поточного зрізу
+    if queue_keys is None:
+        keys = list(norm_by_queue.keys())
+    else:
+        keys = list(queue_keys) if queue_keys else list(norm_by_queue.keys())
+    if not keys:
+        log_to_buffer("ℹ️ Немає черг для запису в Mongo")
+        return
+
+    # Fallback, якщо в records раптом немає дат
+    clock_today = datetime.now().strftime("%Y-%m-%d")
+    clock_tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    saved = 0
+    errors = 0
+    sample_dates = None
+
+    for queue_key in sorted(keys):
+        records = norm_by_queue.get(queue_key) or []
+        try:
+            cherga, pidcherga = _queue_parts(queue_key)
+            if not cherga:
+                continue
+
+            dates = _dates_in_records(records)
+            if dates:
+                day0 = dates[0]
+                day1 = dates[1] if len(dates) > 1 else None
+            else:
+                day0 = clock_today
+                day1 = clock_tomorrow
+
+            if sample_dates is None:
+                sample_dates = dates or [day0]
+
+            slots_today = records_to_slots_for_date(records, day0)
+            slots_tomorrow = (
+                records_to_slots_for_date(records, day1) if day1 else []
+            )
+            text_parts = [f"{s['from']}–{s['to']}" for s in slots_today]
+            text = ", ".join(text_parts) if text_parts else "немає відключень"
+            extra = {
+                "slots_tomorrow": slots_tomorrow,
+                "queue_key": queue_key,
+                "source": "monitor.py",
+                "dates_in_source": dates,
+            }
+
+            # Ключ 4|2 і alias 4.2 — бот шукає обидва
+            upsert_queue_schedule(
+                cherga, pidcherga,
+                slots=slots_today, events=slots_today,
+                text=text, date=day0, known=True, extra=extra,
+            )
+            upsert_queue_schedule(
+                queue_key, "",
+                slots=slots_today, events=slots_today,
+                text=text, date=day0, known=True, extra=extra,
+            )
+            saved += 1
+        except Exception as e:
+            errors += 1
+            log_to_buffer(f"⚠️ Mongo queue {queue_key}: {e}")
+
+    log_to_buffer(
+        f"🗄 Mongo: збережено {saved} черг (dates={sample_dates}), помилок={errors}"
+    )
+
+
+def _extract_changes_for_dm(diff: Dict) -> Dict[str, List[dict]]:
+    """
+    З diff['per_queue'] збирає для DM:
+      { "6.1": [ {"change": "added"|"removed", "start": "12:00", "end": "13:00"}, ... ] }
+    Бере змінені дати (не new_dates), усі діапазони.
+    """
+    out: Dict[str, List[dict]] = {}
+    for q, info in (diff.get("per_queue") or {}).items():
+        items = []
+        for date, ranges in (info.get("changed_dates") or {}).items():
+            for r in ranges:
+                items.append({
+                    "change": r.get("change") or "added",
+                    "start": r.get("start") or "",
+                    "end": r.get("end") or "",
+                    "date": date,
+                })
+        # нові дати — з реальною датою (для header і розкладу на завтра)
+        for nd in info.get("new_dates") or []:
+            items.append({
+                "change": "new",
+                "start": "",
+                "end": "",
+                "date": nd,
+            })
+        if items:
+            out[q] = items
+    return out
+
+
+def notify_bot_users(
+    changed_queues: List[str],
+    channel_message: str,
+    diff: Optional[Dict] = None,
+) -> None:
+    """
+    Сповіщення підписникам бота ztoe (users.notify=true),
+    у яких адреса з чергою з changed_queues.
+
+    Новий короткий формат + один скрін ЖОЕ.
+    """
+    try:
+        from bot_notify import notify_bot_users_with_images
+        from datetime import datetime as _dt
+
+        header = "🔔 Оновлення графіка відключень"
+        msg = (channel_message or "").strip()
+        if msg.startswith("🔔"):
+            header = msg.split("\n")[0].strip()
+
+        changes = _extract_changes_for_dm(diff or {})
+        # Дата для fallback: перша реальна дата з changes (new/changed),
+        # а не завжди «сьогодні» — інакше при новому графіку на завтра
+        # з'являлось порожнє «оновлення» на сьогодні.
+        date_str = _dt.now().strftime("%d.%m.%Y")
+        seen_dates = []
+        for items in changes.values():
+            for c in items or []:
+                d = (c.get("date") or "").strip()
+                if d and d not in seen_dates:
+                    seen_dates.append(d)
+        if seen_dates:
+            # беремо найранішу (як є в diff; формат DD.MM.YYYY або YYYY-MM-DD)
+            try:
+                def _key(s: str):
+                    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+                        try:
+                            return _dt.strptime(s, fmt)
+                        except ValueError:
+                            continue
+                    return _dt.max
+                date_str = sorted(seen_dates, key=_key)[0]
+            except Exception:
+                date_str = seen_dates[0]
+
+        log_to_buffer(
+            f"📬 DM prepare: queues={changed_queues} "
+            f"changes_keys={list(changes.keys())} "
+            f"date_str={date_str} "
+            f"has_ztoe_token={bool(os.getenv('ZTOE_BOT_TOKEN'))}"
+        )
+
+        notify_bot_users_with_images(
+            msg,
+            queue_keys=changed_queues or [],
+            all_user_queues=False,
+            header=header,
+            date_str=date_str,
+            personalize=True,
+            changes=changes,
+        )
+    except Exception as e:
+        log_to_buffer(f"❌ notify_bot_users: {e}")
+
+
+
 def main():
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_to_buffer("=" * 60)
@@ -544,11 +820,17 @@ def main():
         )
         log_to_buffer(f"🔐 Витягнено хеші для {len(current_main_hashes)} черг")
 
-        # 3. Зберегти поточні нормалізовані дані
+        if not current_main_hashes:
+            log_to_buffer(
+                "❌ Усі черги з помилкою API — current.json і last_hash.json не чіпаю"
+            )
+            return
+
+        # 3. Зберегти поточні нормалізовані дані (локально для diff)
         if CURRENT_FILE.exists():
             shutil.copy(CURRENT_FILE, PREVIOUS_FILE)
             log_to_buffer("📋 Попередній current.json скопійовано в previous.json")
-        
+
         save_json(norm_by_queue, CURRENT_FILE)
         log_to_buffer("💾 Нормалізовані дані збережено в data/current.json")
 
@@ -560,11 +842,12 @@ def main():
         diff = build_diff(norm_by_queue, current_main_hashes, current_span_hashes, last_state)
 
         if not diff["queues"] and not diff["new_dates"]:
-            log_to_buffer("✅ Дані по всіх чергах не змінилися")
+            log_to_buffer("✅ Дані по всіх чергах не змінилися — Mongo/DM не чіпаємо")
             save_state(current_main_hashes, current_span_hashes, timestamp)
             return
 
         log_to_buffer(f"🔔 Зміни виявлено для: {', '.join(diff['queues'])}")
+
 
         # 6+7. Дата + скрін одним проходом Chromium (тільки при змінах)
         date_content, screenshot_path, screenshot_hash = fetch_site_update_and_screenshot()
@@ -574,6 +857,16 @@ def main():
         from pathlib import Path as _Path
         img_path = _Path(screenshot_path) if screenshot_path else None
 
+        # 7b. Зберегти скрін у Mongo (для /check у боті)
+        if img_path and img_path.exists():
+            try:
+                from mongo_store import save_site_screenshot
+                png_bytes = img_path.read_bytes()
+                fid = save_site_screenshot(png_bytes, source_hash=screenshot_hash or "")
+                log_to_buffer(f"🗄 Скрін ЖОЕ збережено в Mongo ({len(png_bytes)} bytes, id={fid})")
+            except Exception as e:
+                log_to_buffer(f"⚠️ Не вдалося зберегти скрін у Mongo: {e}")
+
         # 8. Визначаємо типи змін
         has_new_dates = bool(diff.get("new_dates"))
         has_changes = any(
@@ -581,66 +874,88 @@ def main():
             for q_info in diff["per_queue"].values()
         )
 
-        # 9. Логіка відправки повідомлень з фото
-        
+        # 9. Канал + збір тексту для DM бота (лише при змінах)
+        dm_text = ""
+
         # Випадок 1: Є ТІЛЬКИ зміни (без нових дат)
-        # -> Надсилаємо повідомлення про зміни + фото
         if has_changes and not has_new_dates:
             log_to_buffer("📤 Надсилаю повідомлення про зміни + фото")
             changes_msg = build_changes_notification(
                 diff, URL, SUBSCRIBE, date_content or ""
             )
             if changes_msg:
+                dm_text = changes_msg
                 ok = send_notification_safe(changes_msg, img_path)
                 if ok:
-                    log_to_buffer("✅ Повідомлення про зміни відправлено")
+                    log_to_buffer("✅ Повідомлення про зміни відправлено в канал")
                 else:
                     log_to_buffer("❌ Помилка надсилання повідомлення про зміни")
             else:
                 log_to_buffer("⚠️ Немає черг зі змінами для відправки")
-        
-        # Випадок 2: Є ТІЛЬКИ новий графік (без змін)
-        # -> Надсилаємо повідомлення про новий графік + фото
+
+        # Випадок 2: Є ТІЛЬКИ новий графік
         elif has_new_dates and not has_changes:
             log_to_buffer("📤 Надсилаю повідомлення про новий графік + фото")
             new_msg = build_new_schedule_notification(
                 diff, norm_by_queue, URL, SUBSCRIBE, date_content or ""
             )
             if new_msg:
+                dm_text = new_msg
                 ok = send_notification_safe(new_msg, img_path)
                 if ok:
-                    log_to_buffer("✅ Повідомлення про новий графік відправлено")
+                    log_to_buffer("✅ Повідомлення про новий графік відправлено в канал")
                 else:
                     log_to_buffer("❌ Помилка надсилання повідомлення про новий графік")
             else:
                 log_to_buffer("⚠️ Немає черг з новими датами для відправки")
-        
+
         # Випадок 3: Є І зміни, І новий графік
-        # -> Надсилаємо два повідомлення: 
-        #    1) зміни + фото
-        #    2) новий графік без фото
         elif has_changes and has_new_dates:
             log_to_buffer("📤 Надсилаю повідомлення про зміни + фото")
             changes_msg = build_changes_notification(
                 diff, URL, SUBSCRIBE, date_content or ""
             )
             if changes_msg:
+                dm_text = changes_msg
                 ok1 = send_notification_safe(changes_msg, img_path)
                 if ok1:
-                    log_to_buffer("✅ Повідомлення про зміни відправлено")
+                    log_to_buffer("✅ Повідомлення про зміни відправлено в канал")
                 else:
                     log_to_buffer("❌ Помилка надсилання повідомлення про зміни")
-            
+
             log_to_buffer("📤 Надсилаю повідомлення про новий графік (без фото)")
             new_msg = build_new_schedule_notification(
                 diff, norm_by_queue, URL, SUBSCRIBE, date_content or ""
             )
             if new_msg:
-                ok2 = send_notification_safe(new_msg, None)  # БЕЗ фото
+                dm_text = (dm_text + "\n\n" + new_msg) if dm_text else new_msg
+                ok2 = send_notification_safe(new_msg, None)
                 if ok2:
-                    log_to_buffer("✅ Повідомлення про новий графік відправлено")
+                    log_to_buffer("✅ Повідомлення про новий графік відправлено в канал")
                 else:
                     log_to_buffer("❌ Помилка надсилання повідомлення про новий графік")
+
+        # 9b. При будь-якому diff — повний sync УСІХ черг у Mongo.
+        # Інакше черги без зміни слотів лишаються з вчорашнім date
+        # і /check показує «світло весь день» за старий день.
+        changed_queues = list(diff.get("queues") or [])
+        try:
+            log_to_buffer(
+                f"🗄 Повний sync queue_schedules для {len(norm_by_queue)} черг "
+                f"(changed={len(changed_queues)}, new_dates={diff.get('new_dates')})"
+            )
+            sync_schedules_to_mongo(norm_by_queue, queue_keys=None)
+        except Exception as e:
+            log_to_buffer(f"❌ sync_schedules_to_mongo: {e}")
+
+        try:
+            notify_bot_users(
+                changed_queues,
+                dm_text or "🔔 Оновлення графіка відключень",
+                diff=diff,
+            )
+        except Exception as e:
+            log_to_buffer(f"❌ notify_bot_users: {e}")
 
         # 10. Оновити тільки хеші
         save_state(current_main_hashes, current_span_hashes, timestamp)
@@ -649,7 +964,8 @@ def main():
     except Exception as e:
         log_to_buffer(f"❌ Критична помилка: {e}")
     finally:
-        send_log_to_channel()
+        # 151 — гілка «Гпв крон»
+        send_log_to_channel(message_thread_id=151)
         log_to_buffer("🏁 Завершення роботи скрипта")
 
 

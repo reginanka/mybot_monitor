@@ -1,7 +1,7 @@
 """
 Спільна розсилка підписникам бота ztoe:
   - 1 адреса → короткий формат
-  - кілька адрес/черг → одне зведене повідомлення + 1 скрін
+  - кілька адрес/черг → скрін + текст одним повідомленням (стиль /check)
 
 Погодинні = queue_schedules (ГПВ API).
 Power-on (outages), пріоритет для ОДНОГО інтервалу часу:
@@ -86,19 +86,159 @@ def user_addresses(u: dict) -> list:
     return []
 
 
+# ---------- user notify preferences ----------
+# users.notify_prefs: {accidents, hourly, ukrenergo, region}
+# quiet_mode + quiet_from/quiet_to (години) + quiet_from_min/quiet_to_min (хвилини)
+# quiet_to exclusive; інтервал може переходити через північ
+# region — зведення «Стан області» (крон ztoe-accidents-summary)
+
+PREF_DEFAULTS = {
+    "accidents": True,
+    "hourly": True,
+    "ukrenergo": True,
+    "region": True,
+}
+
+
+def user_prefs(u: dict | None) -> dict:
+    if not u:
+        return dict(PREF_DEFAULTS)
+    raw = u.get("notify_prefs")
+    if isinstance(raw, dict):
+        return {k: bool(raw.get(k, True)) for k in PREF_DEFAULTS}
+    if u.get("notify", True) is False:
+        return {k: False for k in PREF_DEFAULTS}
+    return dict(PREF_DEFAULTS)
+
+
+def user_wants(u: dict | None, kind: str) -> bool:
+    """kind: accidents | hourly | ukrenergo | region. False if master notify off or pref off."""
+    if not u:
+        return False
+    if u.get("notify", True) is False:
+        return False
+    prefs = user_prefs(u)
+    if kind not in prefs:
+        return True
+    return bool(prefs.get(kind))
+
+
+def _clamp_h(v, default: int = 23) -> int:
+    try:
+        return int(v) % 24
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_m(v, default: int = 0) -> int:
+    try:
+        m = int(v)
+        if m < 0:
+            return 0
+        if m > 59:
+            return 59
+        return m
+    except (TypeError, ValueError):
+        return default
+
+
+def is_quiet_now(u: dict | None) -> bool:
+    """True → send with disable_notification (без звуку).
+    Підтримує quiet_from_min / quiet_to_min (як у ZTOE-боті).
+    """
+    if not u or not u.get("quiet_mode"):
+        return False
+    fh = _clamp_h(u.get("quiet_from", 23), 23)
+    fm = _clamp_m(u.get("quiet_from_min", 0), 0)
+    th = _clamp_h(u.get("quiet_to", 7), 7)
+    tm = _clamp_m(u.get("quiet_to_min", 0), 0)
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Europe/Kyiv"))
+    except Exception:
+        now = datetime.now()
+    cur = now.hour * 60 + now.minute
+    start = fh * 60 + fm
+    end = th * 60 + tm
+    if start == end:
+        return True
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end
+
+
+def load_notify_users(kind: str | None = None) -> list:
+    """
+    Користувачі з notify=true.
+    Якщо kind заданий — лише ті, у кого цей тип увімкнений.
+    """
+    try:
+        db = get_db()
+        users = list(db["users"].find({"notify": True}))
+    except Exception as e:
+        log_to_buffer(f"❌ Mongo users: {e}")
+        return []
+    if kind is None:
+        return users
+    return [u for u in users if user_wants(u, kind)]
+
+
+
+
+_NO_GPV_MARKERS = (
+    "не вимикається",
+    "не вимикають",
+    "не відключається",
+    "не відключають",
+    "без відключень",
+)
+
+
+def _is_no_gpv_queue(text: str) -> bool:
+    """Черга — не номер, а пояснення «в цей час не вимикається…»."""
+    t = (text or "").strip().lower()
+    if not t or re.match(r"^[\d.]+$", t):
+        return False
+    return any(m in t for m in _NO_GPV_MARKERS)
+
+
 def queue_label(queue: str, subqueue: str = "") -> str:
+    """Коротка мітка (6.1). Для спец-текстів «не вимикають» — порожньо."""
     q = (queue or "").strip()
     sq = (subqueue or "").strip()
     if not q:
         return ""
+    if _is_no_gpv_queue(q) or _is_no_gpv_queue(sq):
+        return ""
     if "." in q or "|" in q:
+        if not re.match(r"^[\d.]+$", q.replace("|", ".")):
+            return ""
         return q.replace("|", ".")
-    return f"{q}.{sq}" if sq else q
+    # підчерга може збігатися з чергою (1.1, 2.2) — не вимагати sq != q
+    if sq and re.match(r"^[\d.]+$", sq):
+        return f"{q}.{sq}"
+    if re.match(r"^[\d.]+$", q):
+        return q
+    return ""
 
 
 def format_address(addr: dict) -> str:
     if not isinstance(addr, dict):
         return "—"
+    # Підписка лише на чергу (без вулиці) — sitemonitor все одно шле ГПВ по queue
+    if addr.get("queue_only"):
+        q = (addr.get("queue") or "").strip()
+        sq = (addr.get("subqueue") or "").strip()
+        if _is_no_gpv_queue(q) or _is_no_gpv_queue(sq):
+            return "не вимикають, крім аварійних"
+        # спочатку збираємо q.sq (інакше «1»+«1» стає просто «1»)
+        if q and sq and re.match(r"^[\d.]+$", q) and re.match(r"^[\d.]+$", sq) and "." not in q:
+            lab = f"{q}.{sq}"
+        elif q and re.match(r"^[\d.]+$", q.replace("|", ".")):
+            lab = q.replace("|", ".")
+        else:
+            lab = q or "?"
+        return f"Черга {lab}"
     city = (addr.get("city_name") or addr.get("city") or "").strip()
     street = (addr.get("street_name") or addr.get("street") or "").strip()
     house = (
@@ -122,6 +262,8 @@ def format_address(addr: dict) -> str:
 
 def collect_notify_targets(
     queue_keys: Optional[Sequence[str]] = None,
+    *,
+    kind: Optional[str] = None,
 ) -> Dict[int, List[Tuple[str, dict]]]:
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
@@ -129,8 +271,7 @@ def collect_notify_targets(
         return {}
 
     try:
-        db = get_db()
-        users = list(db["users"].find({"notify": True}))
+        users = load_notify_users(kind)
     except Exception as e:
         log_to_buffer(f"❌ Mongo users: {e}")
         return {}
@@ -143,7 +284,8 @@ def collect_notify_targets(
         tid = u.get("telegram_id")
         if tid is None:
             continue
-        matched: List[Tuple[str, dict]] = []
+        all_addrs: List[Tuple[str, dict]] = []
+        hit_changed = False  # чи є хоч одна адреса з чергою зі змін
         user_labs: List[str] = []
         for addr in user_addresses(u):
             if not isinstance(addr, dict):
@@ -151,34 +293,35 @@ def collect_notify_targets(
             q = (addr.get("queue") or "").strip()
             sq = (addr.get("subqueue") or "").strip()
             if not q:
+                all_addrs.append(("", addr))
                 continue
-            label = queue_label(q, sq)
+            label = queue_label(q, sq)  # "" для «не вимикають…»
             if label:
                 user_labs.append(label)
+            # мітка для розкладу: номер черги, або "" (спец / без)
+            lab = label or ""
+            all_addrs.append((lab, addr))
             if keys:
                 for qk in keys:
                     if addr_matches_queue(addr, qk):
-                        ch, pid = _queue_parts(qk)
-                        lab = f"{ch}.{pid}" if pid else ch
-                        if not any(
-                            m[0] == lab
-                            and format_address(m[1]) == format_address(addr)
-                            for m in matched
-                        ):
-                            matched.append((lab, addr))
+                        hit_changed = True
                         break
             else:
-                if label and not any(
-                    m[0] == label
-                    and format_address(m[1]) == format_address(addr)
-                    for m in matched
-                ):
-                    matched.append((label, addr))
+                hit_changed = True
         if user_labs:
             all_labels.append(f"tid={tid}:[{','.join(user_labs)}]")
-        if matched:
+        # шлемо, якщо збіглась черга зі змін (або без фільтра)
+        # у розклад потрапляють УСІ адреси юзера: з відключеннями, «світло», без черги
+        if hit_changed and all_addrs:
+            # унікальні за адресою
+            uniq: List[Tuple[str, dict]] = []
+            for lab, addr in all_addrs:
+                if not any(
+                    format_address(m[1]) == format_address(addr) for m in uniq
+                ):
+                    uniq.append((lab, addr))
             try:
-                targets[int(tid)] = matched
+                targets[int(tid)] = uniq
             except (TypeError, ValueError):
                 log_to_buffer(f"⚠️ bad telegram_id={tid!r}")
 
@@ -311,8 +454,8 @@ def load_queue_doc(label: str) -> dict | None:
 
 
 def _slots_from_doc(doc: dict | None, *, day: int = 0) -> List[Tuple[str, str]]:
-    """day=0 → slots (сьогодні), day=1 → slots_tomorrow."""
-    if not doc:
+    """day=0 → slots, day=1 → slots_tomorrow; day<0/>1 → немає ГПВ (далека дата)."""
+    if not doc or day < 0 or day > 1:
         return []
     if day == 1:
         slots = doc.get("slots_tomorrow") or []
@@ -353,36 +496,55 @@ def _ymd(date_str: str) -> str:
 
 
 def _day_offset(date_str: str) -> int:
-    """0 = сьогодні, 1 = завтра, інакше 0 (fallback на сьогоднішні слоти)."""
+    """
+    0 = сьогодні, 1 = завтра.
+    -1 = дата поза відомим ГПВ (далекий ремонт) — погодинних не підставляти.
+    """
     ymd = _ymd(date_str)
     if not ymd:
-        return 0
+        return -1
     try:
         d = datetime.strptime(ymd, "%Y-%m-%d").date()
     except ValueError:
-        return 0
+        return -1
     today = datetime.now().date()
     if d == today:
         return 0
     if d == today + timedelta(days=1):
         return 1
-    return 0
+    return -1
 
 
 def _dates_from_changes(
     changes: Optional[Dict[str, List[dict]]],
     fallback: str,
+    labs: Optional[Sequence[str]] = None,
 ) -> List[str]:
-    """Унікальні дати з diff (порядок збереження), у форматі YYYY-MM-DD."""
-    seen = []
-    for items in (changes or {}).values():
+    """Унікальні дати з diff, у форматі YYYY-MM-DD, за зростанням (спочатку раніша).
+
+    Якщо передано labs — беремо дати лише з цих черг (щоб не тягнути
+    «чужі» дати інших черг і не показувати порожні блоки).
+    """
+    seen = set()
+    src = changes or {}
+    if labs is not None:
+        keys = [lab for lab in labs if lab]
+        iter_items = (src.get(lab) or [] for lab in keys)
+    else:
+        iter_items = src.values()
+    for items in iter_items:
         for c in items or []:
             d = _ymd(c.get("date") or "")
-            if d and d not in seen:
-                seen.append(d)
+            if d:
+                seen.add(d)
     if not seen:
-        seen.append(_ymd(fallback) or datetime.now().strftime("%Y-%m-%d"))
-    return seen
+        # Не підставляємо сьогодні «на всяк випадок», якщо changes є,
+        # але для потрібних labs дат немає — краще порожній список.
+        if labs is not None and src:
+            return []
+        fb = _ymd(fallback) or datetime.now().strftime("%Y-%m-%d")
+        return [fb]
+    return sorted(seen)
 
 
 def _norm_street(name: str) -> str:
@@ -575,12 +737,14 @@ def _dedupe_by_priority(
 
 
 def _format_slots_line(prefix: str, slots: List[Tuple[str, str]]) -> str:
-    """Рядок деталей; час жирний+підкреслений."""
+    """Рядок деталей; час підкреслений одним тегом (менше Telegram entities).
+    Порожні слоти не показуємо (без спаму «…: немає»).
+    """
     if not slots:
-        return f"{prefix}: немає"
-    parts = [f"<b><u>{a}–{b}</u></b>" for a, b in slots]
+        return ""
+    parts = [f"{a}-{b}" for a, b in slots]
     h = _total_minutes(slots)
-    return f"{prefix}: {', '.join(parts)} ({_fmt_duration(h)})"
+    return f"{prefix}: <u>{', '.join(parts)}</u> ({_fmt_duration(h)})"
 
 
 def _short_time(t: str) -> str:
@@ -611,30 +775,57 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     all_merged = _merge_intervals(scheduled + emerg + repair + other)
     addr_str = _html_esc(format_address(addr))
     lab_esc = _html_esc(lab)
+    q_raw = (addr.get("queue") or "").strip()
+    sq_raw = (addr.get("subqueue") or "").strip()
+    no_gpv = _is_no_gpv_queue(q_raw) or _is_no_gpv_queue(sq_raw) or not lab
+
+    if addr.get("queue_only") and lab:
+        head = f"<b>Черга {lab_esc}</b>"
+    elif lab:
+        head = f"{addr_str} (<b>Черга {lab_esc}</b>)"
+    elif no_gpv and not addr.get("queue_only"):
+        head = f"{addr_str} (<i>не вимикають, крім аварійних</i>)"
+    elif addr.get("queue_only"):
+        head = "<i>не вимикають, крім аварійних</i>"
+    else:
+        head = f"{addr_str} (<i>черга не визначена</i>)"
+
+    # ГПВ є лише для day 0/1; day=-1 = далека дата без графіка
+    has_gpv_data = day >= 0
 
     if all_merged:
-        ranges = ", ".join(f"<b><u>{a}–{b}</u></b>" for a, b in all_merged)
+        ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
+        # один <u> на всі інтервали — інакше Telegram ріже entities з кінця повідомлення
         summary = (
-            f"Світла не буде ({_fmt_duration(_total_minutes(all_merged))}): "
-            f"{ranges}"
+            f"<b>🪫 Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
+            f"<u>{ranges}</u>"
         )
+    elif has_gpv_data:
+        summary = "🔋 Світло буде увесь день"
     else:
-        summary = "Світла не буде: немає відключень"
+        # ЖОЕ ще не передав ГПВ на цей день — не стверджуємо «світло весь день»
+        summary = "🔄 Дані очікуємо"
 
-    detail_lines = [
-        summary,
-        "⬇️⬇️⬇️",
-        "Деталі:",
-        _format_slots_line("⏰ Погодинні", scheduled),
-        _format_slots_line("🔴 Аварійні", emerg),
-        _format_slots_line("🟠 Ремонтні", repair),
-    ]
+    # Деталі лише якщо є аварійні / ремонтні / інші (не дублюємо чисті ГПВ)
+    extra_lines = []
+    if emerg:
+        extra_lines.append(_format_slots_line("⚠️ Аварійні", emerg))
+    if repair:
+        extra_lines.append(_format_slots_line("🛠 Ремонтні", repair))
     if other:
-        detail_lines.append(_format_slots_line("⚪ Інші", other))
+        extra_lines.append(_format_slots_line("⚪ Інші", other))
 
-    body = "\n".join(detail_lines)
+    # Черга без адреси або лише ГПВ — підсумок у цитаті, без «Деталі»
+    if addr.get("queue_only") or not extra_lines:
+        return f"{head}\n<blockquote>{summary}</blockquote>"
+
+    detail = [summary, "⬇️⬇️⬇️", "Деталі:"]
+    if scheduled:
+        detail.append(_format_slots_line("⏰ Погодинні", scheduled))
+    detail.extend(extra_lines)
+    body = "\n".join(detail)
     return (
-        f"{addr_str} (<b>Черга {lab_esc}</b>)\n"
+        f"{head}\n"
         f"<blockquote expandable>{body}</blockquote>"
     )
 
@@ -651,6 +842,39 @@ def _change_line(c: dict) -> str:
     return "🔋 скасували відключення"
 
 
+def _items_for_lab_day(
+    changes: Dict[str, List[dict]],
+    lab: str,
+    d: str,
+    dates: List[str],
+) -> List[dict]:
+    items = [
+        c
+        for c in (changes.get(lab) or [])
+        if not c.get("date") or _ymd(c.get("date") or "") == d
+    ]
+    if not items and dates and d == dates[0]:
+        items = [
+            c
+            for c in (changes.get(lab) or [])
+            if not c.get("date")
+        ]
+    return items
+
+
+def _is_new_schedule_only(items: List[dict]) -> bool:
+    """Лише «новий графік» без конкретних інтервалів."""
+    if not items:
+        return False
+    for c in items:
+        ch = (c.get("change") or "").strip()
+        if ch not in ("new", "added"):
+            return False
+        if (c.get("start") or "").strip() or (c.get("end") or "").strip():
+            return False
+    return True
+
+
 def build_changes_text(
     queue_labels_with_addr: Sequence[Tuple[str, dict]],
     changes: Optional[Dict[str, List[dict]]] = None,
@@ -658,45 +882,139 @@ def build_changes_text(
 ) -> str:
     """
     Блок «що змінилось» — під скрін.
-    Групує по датах з diff (не лише «сьогодні»).
+    Групує по датах; «новий графік» на день — одним рядком на кілька черг.
+
+    Не спамить: якщо для черг користувача на дату немає реальних items
+    (ні new, ні added/removed з інтервалами) — дата/черга просто пропускається.
+    Якщо після фільтрації нічого не лишилось — повертає порожній рядок.
     """
     changes = changes or {}
     labs_order: List[str] = []
     for lab, _ in queue_labels_with_addr:
-        if lab not in labs_order:
+        if lab and lab not in labs_order:
             labs_order.append(lab)
 
-    dates = _dates_from_changes(changes, date_str)
-    lines = [
-        f"Для черг {', '.join(_html_esc(x) for x in labs_order)} "
-        f"🔔 ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!",
-        "",
-    ]
+    if not labs_order:
+        return ""
+
+    # Дати лише з черг цього користувача — інакше з'являються «чужі» дні
+    # з порожнім «оновлення графіка».
+    dates = _dates_from_changes(changes, date_str, labs=labs_order)
+
+    body_blocks: List[str] = []
+    labs_with_any_change: List[str] = []
 
     for d in dates:
-        lines.append(f"📅 {_html_esc(_fmt_date_display(d))}")
-        lines.append("")
+        new_sched_labs: List[str] = []
+        detail_labs: List[Tuple[str, List[dict]]] = []
+
         for lab in labs_order:
-            items = [
-                c
-                for c in (changes.get(lab) or [])
-                if not c.get("date") or _ymd(c.get("date") or "") == d
-            ]
-            # якщо в diff дата порожня — показуємо всі items лише на першій даті
-            if not items and d == dates[0]:
-                items = [
-                    c
-                    for c in (changes.get(lab) or [])
-                    if not c.get("date")
-                ]
-            lines.append(f"▶️ Черга <b>{_html_esc(lab)}</b>:")
-            if not items:
-                lines.append("оновлення графіка")
-            else:
-                for c in items:
-                    lines.append(_change_line(c))
-            lines.append("")
-    return "\n".join(lines).strip()
+            items = _items_for_lab_day(changes, lab, d, dates)
+            if _is_new_schedule_only(items):
+                new_sched_labs.append(lab)
+            elif items:
+                # є реальні зміни інтервалів (added/removed або new з часом)
+                detail_labs.append((lab, items))
+            # else: порожньо → НЕ додаємо «оновлення графіка»
+
+        if not new_sched_labs and not detail_labs:
+            # На цю дату для черг користувача нічого немає — пропуск
+            continue
+
+        block: List[str] = [f"📅 {_html_esc(_fmt_date_display(d))}", ""]
+
+        if new_sched_labs:
+            labs_txt = ", ".join(_html_esc(x) for x in new_sched_labs)
+            block.append(
+                f"🆕 Для черг <b>{labs_txt}</b> додали новий графік на цей день"
+            )
+            block.append("")
+            for lab in new_sched_labs:
+                if lab not in labs_with_any_change:
+                    labs_with_any_change.append(lab)
+
+        for lab, items in detail_labs:
+            if lab in new_sched_labs:
+                continue
+            block.append(f"▶️ Черга <b>{_html_esc(lab)}</b>:")
+            for c in items:
+                block.append(_change_line(c))
+            block.append("")
+            if lab not in labs_with_any_change:
+                labs_with_any_change.append(lab)
+
+        body_blocks.append("\n".join(block).rstrip())
+
+    if not body_blocks:
+        # Немає жодної реальної зміни для черг цього користувача
+        return ""
+
+    labs_str = ", ".join(_html_esc(x) for x in labs_with_any_change) if labs_with_any_change else "—"
+    header = f"Для черг {labs_str} 🔔 <b>ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!</b>"
+    return (header + "\n\n" + "\n\n".join(body_blocks)).strip()
+
+
+def _addr_head_line(lab: str, addr: dict) -> str:
+    """Рядок адреси + черга для списків / груп."""
+    addr_str = _html_esc(format_address(addr))
+    lab_esc = _html_esc(lab)
+    if addr.get("queue_only") and lab:
+        return f"<b>Черга {lab_esc}</b>"
+    if lab:
+        return f"{addr_str} (<b>Черга {lab_esc}</b>)"
+    q = (addr.get("queue") or "").strip()
+    sq = (addr.get("subqueue") or "").strip()
+    if not q:
+        return (
+            f"{addr_str} (<i>черга не обрана</i>)\n"
+            f"<i>➡️ Передодай адресу в боті, щоб бачити графік</i>"
+        )
+    if _is_no_gpv_queue(q) or _is_no_gpv_queue(sq):
+        return f"{addr_str} (<i>не вимикають, крім аварійних</i>)"
+    return addr_str
+
+
+def _outage_under_header(
+    lab: str,
+    addr: dict,
+    *,
+    scheduled: List[Tuple[str, str]],
+    emerg: List[Tuple[str, str]],
+    repair: List[Tuple[str, str]],
+    other: List[Tuple[str, str]],
+    all_merged: List[Tuple[str, str]],
+) -> str:
+    """
+    Під заголовком «Світла не буде по адресах»:
+      адреса + звичайна цитата (лише ГПВ)
+      або expandable з Деталями (ремонт/аварія).
+    """
+    head = _addr_head_line(lab, addr)
+    ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
+    summary = f"<u>{ranges}</u> ({_fmt_duration(_total_minutes(all_merged))})"
+
+    extra_lines = []
+    if emerg:
+        extra_lines.append(_format_slots_line("⚠️ Аварійні", emerg))
+    if repair:
+        extra_lines.append(_format_slots_line("🛠 Ремонтні", repair))
+    if other:
+        extra_lines.append(_format_slots_line("⚪ Інші", other))
+
+    if not extra_lines:
+        return f"{head}\n<blockquote>{summary}</blockquote>"
+
+    detail = [summary, "⬇️⬇️⬇️", "Деталі:"]
+    if scheduled:
+        detail.append(_format_slots_line("⏰ Погодинні", scheduled))
+    detail.extend(extra_lines)
+    return f"{head}\n<blockquote expandable>{chr(10).join(detail)}</blockquote>"
+
+
+def _grouped_ok_blockquote(title: str, heads: List[str]) -> str:
+    """Заголовок зовні, стрілки + список — у згортаємій цитаті."""
+    body = "⬇️⬇️⬇️\n" + "\n".join(heads)
+    return f"{title}\n<blockquote expandable>{body}</blockquote>"
 
 
 def build_schedule_text(
@@ -706,23 +1024,102 @@ def build_schedule_text(
     date_str: str = "",
 ) -> str:
     """
-    Наступне повідомлення: дата → адреси «Світла не буде…»,
-    потім знову дата → знову адреси (якщо кілька днів).
+    По днях:
+      🪫 Світла не буде по адресах  (заголовок)
+      адреса + цитата з інтервалами / деталями
+      🔋 / 🔄 — згортаєма група адрес без відключень
     """
-    dates = _dates_from_changes(changes, date_str)
     items = list(queue_labels_with_addr)
     if not items:
         return ""
+    labs_for_dates = [lab for lab, _ in items if lab]
+    dates = _dates_from_changes(changes, date_str, labs=labs_for_dates or None)
+    if not dates:
+        # немає дат у changes для цих черг — один день з fallback (сьогодні)
+        fb = _ymd(date_str) or datetime.now().strftime("%Y-%m-%d")
+        dates = [fb]
+
+    # адреси без черги — один блок на все повідомлення (не на кожен день)
+    queued_items = [
+        (lab, addr)
+        for lab, addr in items
+        if (lab or "").strip() or (addr.get("queue") or "").strip()
+    ]
+    no_queue_heads = [
+        _addr_head_line(lab, addr)
+        for lab, addr in items
+        if not (lab or "").strip() and not (addr.get("queue") or "").strip()
+    ]
 
     parts: List[str] = []
-    for d in dates:
+    for day_i, d in enumerate(dates):
+        if day_i > 0:
+            parts.append("")
         parts.append(f"📅 <b>{_html_esc(_fmt_date_display(d))}</b>")
         parts.append("")
-        for lab, addr in items:
-            parts.append("—")
-            parts.append(_schedule_block(lab, addr, d))
+
+        day = _day_offset(d)
+        has_gpv = day >= 0
+        disp = _fmt_date_display(d)
+        outage_blocks: List[str] = []
+        ok_or_wait: List[str] = []
+        for lab, addr in queued_items:
+            scheduled = _slots_from_doc(load_queue_doc(lab), day=day)
+            buckets = _outages_bucketed(addr, disp)
+            scheduled, emerg, repair, other = _dedupe_by_priority(
+                scheduled,
+                buckets.get("emergency") or [],
+                buckets.get("repair") or [],
+                buckets.get("other") or [],
+            )
+            all_merged = _merge_intervals(scheduled + emerg + repair + other)
+            if all_merged:
+                outage_blocks.append(
+                    _outage_under_header(
+                        lab,
+                        addr,
+                        scheduled=scheduled,
+                        emerg=emerg,
+                        repair=repair,
+                        other=other,
+                        all_merged=all_merged,
+                    )
+                )
+            else:
+                ok_or_wait.append(_addr_head_line(lab, addr))
+
+        if outage_blocks:
+            parts.append("🪫 <b>Світла не буде по адресах</b>")
+            parts.append("⬇️⬇️⬇️")
             parts.append("")
-    return "\n".join(parts).strip()
+            for block in outage_blocks:
+                parts.append(block)
+                parts.append("")
+        if ok_or_wait:
+            title = (
+                "🔋 <b>Світло буде увесь день по адресах</b>"
+                if has_gpv
+                else "🔄 <b>Дані очікуємо по адресах</b>"
+            )
+            parts.append(_grouped_ok_blockquote(title, ok_or_wait))
+            parts.append("")
+
+    if no_queue_heads:
+        parts.append("")
+        parts.append(
+            _grouped_ok_blockquote(
+                "⚠️ <b>Адреси без черги</b>", no_queue_heads
+            )
+        )
+
+    body = "\n".join(parts).strip()
+    if not body:
+        return ""
+    # Заголовок першого повідомлення під скріном
+    return (
+        "📊 <b>АКТУАЛЬНИЙ ГРАФІК З УРАХУВАННЯМ ЗМІН</b>\n\n"
+        + body
+    )
 
 
 def build_personal_dm(
@@ -736,9 +1133,113 @@ def build_personal_dm(
         date_str = datetime.now().strftime("%d.%m.%Y")
     a = build_changes_text(queue_labels_with_addr, changes, date_str)
     b = build_schedule_text(queue_labels_with_addr, changes=changes, date_str=date_str)
+    # спочатку зміни (під фото), потім актуальний графік
     if a and b:
         return f"{a}\n\n{b}"
     return a or b or "🔔 Оновлення графіка"
+
+
+
+CAPTION_LIMIT = 1024
+TEXT_LIMIT = 4096
+
+
+def _split_header_and_days(text: str) -> tuple[str, list[str]]:
+    """Шапка (зміни / статус) і блоки, що починаються з рядка 📅 — як у /check."""
+    lines = (text or "").splitlines()
+    first = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("📅"):
+            first = i
+            break
+    if first is None:
+        return (text or "").strip(), []
+    header = "\n".join(lines[:first]).strip()
+    days: list[str] = []
+    buf: list[str] = []
+    for line in lines[first:]:
+        if line.strip().startswith("📅") and buf:
+            days.append("\n".join(buf).strip())
+            buf = [line]
+        else:
+            buf.append(line)
+    if buf and "\n".join(buf).strip():
+        days.append("\n".join(buf).strip())
+    return header, days
+
+
+def _text_chunks(text: str, limit: int) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    out: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            out.append(rest)
+            break
+        cut = rest.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        piece = rest[:cut].strip()
+        if piece:
+            out.append(piece)
+        rest = rest[cut:].strip()
+    return out
+
+
+def plan_dm_messages(text: str) -> tuple[str, list[str]]:
+    """
+    caption — підпис до фото (≤1024), follow — наступні повідомлення.
+
+    Як у /check (handlers.plan_check_messages), з пріоритетом по днях:
+      • є кілька 📅 днів → під фото шапка + ПЕРШИЙ день; решта днів окремо
+        (навіть якщо все б вмістилось у 1024 — другий день не в caption)
+      • один день і все ≤1024 → лише caption
+      • шапка+перший день >1024 → під фото лише шапка; дні окремо
+    """
+    full = (text or "").strip()
+    if not full:
+        return "", []
+
+    header, days = _split_header_and_days(full)
+
+    # немає розбиття по 📅 — як раніше: все в caption, якщо влазить
+    if not days:
+        if len(full) <= CAPTION_LIMIT:
+            return full, []
+        parts = _text_chunks(full, TEXT_LIMIT)
+        caption = parts[0] if len(parts[0]) <= CAPTION_LIMIT else parts[0][:CAPTION_LIMIT]
+        return caption, parts[1:]
+
+    # один день: можна все під фото, якщо ≤1024
+    if len(days) == 1:
+        first = f"{header}\n\n{days[0]}".strip() if header else days[0]
+        if len(first) <= CAPTION_LIMIT:
+            return first, []
+        # не влазить — лише шапка під фото
+        caption = header or "🔔 Оновлення графіка"
+        if len(caption) > CAPTION_LIMIT:
+            caption = caption[: CAPTION_LIMIT - 1] + "…"
+        return caption, _text_chunks(days[0], TEXT_LIMIT)
+
+    # кілька днів: під фото ТІЛЬКИ шапка + перший день; решта — окремо
+    first = f"{header}\n\n{days[0]}".strip() if header else days[0]
+    if len(first) <= CAPTION_LIMIT:
+        caption = first
+        rest_days = days[1:]
+    else:
+        caption = header or "🔔 Оновлення графіка"
+        if len(caption) > CAPTION_LIMIT:
+            caption = caption[: CAPTION_LIMIT - 1] + "…"
+        rest_days = days  # перший день теж окремо
+
+    follow: list[str] = []
+    for day in rest_days:
+        follow.extend(_text_chunks(day, TEXT_LIMIT))
+    return caption, follow
 
 
 def notify_bot_users_with_images(
@@ -750,13 +1251,14 @@ def notify_bot_users_with_images(
     date_str: str = "",
     personalize: bool = True,
     changes: Optional[Dict[str, List[dict]]] = None,
+    kind: Optional[str] = "hourly",
 ) -> None:
     """
-    Формат DM:
-      1) скрін + caption = блок змін (як у каналі під фото)
-         якщо caption > 1024 → фото з 📸, далі окремо текст змін
-      2) наступне повідомлення: 📅 дата + «Світла не буде» по адресах
-         (якщо кілька дат — дата, блоки, знов дата, блоки)
+    Формат DM як /check:
+      фото + caption РАЗОМ (не окремий скрін).
+      caption: зміни/шапка + перший день (якщо ≤1024);
+      якщо не вміщається — під фото лише шапка, дні окремими повідомленнями.
+      другий день — завжди окремо, якщо не вліз у caption.
     """
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
@@ -764,12 +1266,22 @@ def notify_bot_users_with_images(
         return
 
     if all_user_queues:
-        targets = collect_notify_targets(None)
+        targets = collect_notify_targets(None, kind=kind)
     else:
         if not queue_keys:
             log_to_buffer("ℹ️ Немає черг для DM")
             return
-        targets = collect_notify_targets(queue_keys)
+        targets = collect_notify_targets(queue_keys, kind=kind)
+
+    # для quiet_mode
+    try:
+        _users_by_tid = {
+            int(u["telegram_id"]): u
+            for u in load_notify_users(kind)
+            if u.get("telegram_id") is not None
+        }
+    except Exception:
+        _users_by_tid = {}
 
     if not targets:
         log_to_buffer(
@@ -788,58 +1300,93 @@ def notify_bot_users_with_images(
 
     sent = 0
     failed = 0
+    sent_quiet = 0
+    sent_sound = 0
     for tid, qs_with_addr in targets.items():
         labs = sorted({lab for lab, _ in qs_with_addr})
+        silent = is_quiet_now(_users_by_tid.get(int(tid)))
 
         if personalize:
             changes_text = build_changes_text(qs_with_addr, changes, date_str)
             schedule_text = build_schedule_text(
                 qs_with_addr, changes=changes, date_str=date_str
             )
+            if not changes_text and not schedule_text:
+                log_to_buffer(
+                    f"ℹ️ skip DM tid={tid}: немає змін і розкладу для черг {labs}"
+                )
+                continue
+
+            # 1) Під фото — ТІЛЬКИ блок змін (якщо є).
+            # 2) Далі окремо — актуальний графік (з 📊), з розбиттям по ліміту.
+            # Не склеюємо в один текст: інакше кілька 📅 ламають plan_dm_messages.
+            caption = ""
+            follow: list[str] = []
+
+            if changes_text and schedule_text:
+                # зміни під фото; графік — наступними повідомленнями
+                caption, ch_follow = plan_dm_messages(changes_text)
+                follow.extend(ch_follow)
+                sch_cap, sch_follow = plan_dm_messages(schedule_text)
+                if sch_cap:
+                    follow.append(sch_cap)
+                follow.extend(sch_follow)
+            elif changes_text:
+                caption, follow = plan_dm_messages(changes_text)
+            else:
+                # лише графік — може бути під фото
+                caption, follow = plan_dm_messages(schedule_text)
         else:
-            changes_text = (
+            full_text = (
                 (message or header or "🔔 Оновлення")
                 + f"\n\n📌 Твої черги: <b>{', '.join(_html_esc(x) for x in labs)}</b>"
             )
-            schedule_text = ""
+            caption, follow = plan_dm_messages(full_text)
 
         ok = False
         photo_ok = False
 
-        # --- 1) скрін + блок змін ---
         if images:
-            if len(changes_text) <= 1024:
-                photo_ok = send_photos_sync(
-                    tid, images, changes_text, bot_token=bot_token
-                )
-                ok = photo_ok
-            else:
-                # як у каналі: фото з 📸, потім текст змін
-                photo_ok = send_photos_sync(tid, images, "📸", bot_token=bot_token)
-                text_ok = send_photos_sync(
-                    tid, [], changes_text[:4096], bot_token=bot_token
-                )
-                ok = photo_ok or text_ok
-            if not ok:
-                log_to_buffer(f"⚠️ DM photo/changes fail tid={tid}, шлю текст змін")
-                ok = send_photos_sync(
-                    tid, [], changes_text[:4096], bot_token=bot_token
-                )
-        else:
-            ok = send_photos_sync(tid, [], changes_text[:4096], bot_token=bot_token)
-
-        # --- 2) розклад по датах/адресах ---
-        if schedule_text:
-            sched_ok = send_photos_sync(
-                tid, [], schedule_text[:4096], bot_token=bot_token
+            photo_ok = send_photos_sync(
+                tid, images, caption or "🔔 Оновлення графіка", bot_token=bot_token,
+                disable_notification=silent,
             )
-            ok = ok or sched_ok
+            ok = photo_ok
+            for part in follow:
+                text_ok = send_photos_sync(
+                    tid, [], part[:TEXT_LIMIT], bot_token=bot_token,
+                    disable_notification=silent,
+                )
+                ok = ok or text_ok
+            if not ok:
+                log_to_buffer(f"⚠️ DM photo fail tid={tid}, шлю лише текст")
+                for part in ([caption] + follow) if caption else follow:
+                    if not part:
+                        continue
+                    ok = send_photos_sync(
+                        tid, [], part[:TEXT_LIMIT], bot_token=bot_token,
+                        disable_notification=silent,
+                    ) or ok
+        else:
+            pieces = [p for p in [caption, *follow] if p]
+            for part in pieces:
+                part_ok = send_photos_sync(
+                    tid, [], part[:TEXT_LIMIT], bot_token=bot_token,
+                    disable_notification=silent,
+                )
+                ok = ok or part_ok
 
         if ok:
             sent += 1
+            if silent:
+                sent_quiet += 1
+            else:
+                sent_sound += 1
             log_to_buffer(
                 f"✓ DM tid={tid} queues={labs} photo={photo_ok} "
-                f"changes_len={len(changes_text)} sched_len={len(schedule_text)}"
+                f"caption_len={len(caption)} follow={len(follow)} "
+                f"{'🔇' if silent else '🔊'} "
+                f"(фото+текст як /check)"
             )
         else:
             failed += 1
@@ -850,5 +1397,6 @@ def notify_bot_users_with_images(
         time.sleep(0.05)
 
     log_to_buffer(
-        f"📬 DM бота: sent={sent} failed={failed} users={len(targets)}"
+        f"📬 DM бота: sent={sent} failed={failed} users={len(targets)} "
+        f"(🔊={sent_sound} 🔇={sent_quiet})"
     )
