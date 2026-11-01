@@ -2,8 +2,6 @@ name: Monitor Ukrenergo 2
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: '*/20 * * * *'
 
 jobs:
   ukrenergo2:
@@ -15,12 +13,13 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
       TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+      ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
       SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
       UKRENERGO2_REGIONS_URL: ${{ secrets.UKRENERGO2_REGIONS_URL }}
       UKRENERGO2_REGION_SLUG: ${{ secrets.UKRENERGO2_REGION_SLUG }}
       UKRENERGO2_REGION_NAME: ${{ secrets.UKRENERGO2_REGION_NAME }}
-      MAYACHOK_MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
-      MAYACHOK_MONGO_DB: ${{ secrets.MAYACHOK_MONGO_DB }}
+      MONGO_URI: ${{ secrets.MONGO_URI }}
+      MONGO_DB: ${{ secrets.MONGO_DB }}
       UKRENERGO_SITE_URL: ${{ secrets.UKRENERGO_SITE_URL }}
       UKRENERGO2_SYNC_REGIONSTATUS: "1"
 

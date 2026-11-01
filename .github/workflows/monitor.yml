@@ -51,6 +51,10 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
           SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          MONGO_DB: ${{ secrets.MONGO_DB }}
+          ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
+          RENDER_SCHEDULE_IMAGES: "1"
         run: python monitor.py
 
       - name: Commit changes
