@@ -2626,7 +2626,7 @@
       "queue_key": "4.1",
       "date": "02.11.2026",
       "span": "19:00-19:30",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 4,
@@ -2634,7 +2634,7 @@
       "queue_key": "4.1",
       "date": "02.11.2026",
       "span": "19:30-20:00",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 4,
@@ -2642,7 +2642,7 @@
       "queue_key": "4.1",
       "date": "02.11.2026",
       "span": "20:00-20:30",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 4,
@@ -2650,7 +2650,7 @@
       "queue_key": "4.1",
       "date": "02.11.2026",
       "span": "20:30-21:00",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 4,
