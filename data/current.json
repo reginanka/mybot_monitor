@@ -54,7 +54,7 @@
       "queue_key": "1.1",
       "date": "03.11.2026",
       "span": "03:00-03:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 1,
@@ -440,7 +440,7 @@
       "queue_key": "1.2",
       "date": "03.11.2026",
       "span": "03:00-03:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 1,
@@ -1220,7 +1220,7 @@
       "queue_key": "2.2",
       "date": "03.11.2026",
       "span": "03:30-04:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -1228,7 +1228,7 @@
       "queue_key": "2.2",
       "date": "03.11.2026",
       "span": "04:00-04:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -1236,7 +1236,7 @@
       "queue_key": "2.2",
       "date": "03.11.2026",
       "span": "04:30-05:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -1244,7 +1244,7 @@
       "queue_key": "2.2",
       "date": "03.11.2026",
       "span": "05:00-05:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -1252,7 +1252,7 @@
       "queue_key": "2.2",
       "date": "03.11.2026",
       "span": "05:30-06:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -2370,7 +2370,7 @@
       "queue_key": "4.1",
       "date": "03.11.2026",
       "span": "03:00-03:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 4,
@@ -2378,7 +2378,7 @@
       "queue_key": "4.1",
       "date": "03.11.2026",
       "span": "03:30-04:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 4,
@@ -2386,7 +2386,7 @@
       "queue_key": "4.1",
       "date": "03.11.2026",
       "span": "04:00-04:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 4,
@@ -2394,7 +2394,7 @@
       "queue_key": "4.1",
       "date": "03.11.2026",
       "span": "04:30-05:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 4,
@@ -2402,7 +2402,7 @@
       "queue_key": "4.1",
       "date": "03.11.2026",
       "span": "05:00-05:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 4,
@@ -2410,7 +2410,7 @@
       "queue_key": "4.1",
       "date": "03.11.2026",
       "span": "05:30-06:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 4,
@@ -2756,7 +2756,7 @@
       "queue_key": "4.2",
       "date": "03.11.2026",
       "span": "03:00-03:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 4,
