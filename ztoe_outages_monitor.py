@@ -651,26 +651,86 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
 
 
 def _norm_street(name: str) -> str:
-    s = (name or "").strip().lower()
-    for pfx in ("вул.", "вул ", "пров.", "провулок ", "проспект ", "пр.", "бульвар ", "пл.", "площа "):
+    s = (name or "").strip().lower().replace("’", "'").replace("`", "'")
+    for pfx in (
+        "вулиця ", "вул.", "вул ", "провулок ", "пров.", "пров ",
+        "проспект ", "просп.", "пр-т ", "пр-к ", "пр.", "пр ",
+        "бульвар ", "бул.", "площа ", "пл.", "пл ",
+    ):
+        if s.startswith(pfx):
+            s = s[len(pfx) :].strip()
+    # «Тараса Шевченка» / «Івана Франка» → ядро прізвища для порівняння
+    for pfx in ("тараса ", "івана ", "лесі ", "миколи ", "богдана ", "степана "):
+        if s.startswith(pfx):
+            s = s[len(pfx) :].strip()
+            break
+    return s
+
+
+def _norm_city(name: str) -> str:
+    s = (name or "").strip().lower().replace("’", "'")
+    for pfx in ("місто ", "м.", "м ", "смт ", "селище ", "село ", "с.", "с "):
         if s.startswith(pfx):
             s = s[len(pfx) :].strip()
     return s
 
 
+def matches_city(outage: dict, addr: dict) -> bool:
+    """
+    Не змішувати однойменні вулиці з різних НП одного РЕМ.
+    Якщо є назви міст і вони різні — відхиляємо.
+    Якщо city_id збігається — ок. Якщо id різні, але назви збігаються — ок (кривий id у профілі).
+    """
+    o_city = outage.get("city") or {}
+    o_id = o_city.get("id")
+    o_name = _norm_city(o_city.get("name") or "")
+    a_id = addr.get("city_id") or addr.get("cityId")
+    a_name = _norm_city(addr.get("city_name") or "")
+
+    if a_id not in (None, "", 0, "0") and o_id is not None:
+        try:
+            if int(a_id) == int(o_id):
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    if a_name and o_name:
+        if a_name == o_name:
+            return True
+        # м'який збіг лише якщо одна назва містить іншу цілком (не короткі уламки)
+        shorter, longer = (a_name, o_name) if len(a_name) <= len(o_name) else (o_name, a_name)
+        if len(shorter) >= 4 and shorter in longer:
+            return True
+        return False
+
+    # Немає назв для порівняння: не блокуємо (плани інколи без city)
+    if not a_name and not o_name:
+        return True
+    # Є лише id і вони різні — без імені не ризикуємо слати
+    if a_id not in (None, "", 0, "0") and o_id is not None:
+        try:
+            return int(a_id) == int(o_id)
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def matches_street(outage: dict, street_id, street_name: str) -> bool:
     o_street = outage.get("street") or {}
     o_street_id = o_street.get("id")
-    o_street_name = (o_street.get("name") or "").lower()
-    if street_id and o_street_id is not None and str(o_street_id) == str(street_id):
+    o_street_name = o_street.get("name") or ""
+    if street_id and o_street_id is not None and str(street_id) == str(o_street_id):
         return True
     a = _norm_street(street_name)
     b = _norm_street(o_street_name)
-    if a and b and (a in b or b in a):
+    if not a or not b:
+        return False
+    if a == b:
         return True
-    if street_name and street_name.lower() in o_street_name:
-        return True
-    if street_name and o_street_name and o_street_name in street_name.lower():
+    # «шевченка» vs «тараса шевченка» вже зведено _norm_street до ядра
+    # containment лише якщо коротша ≥ 6 символів (відсікає випадкові уламки)
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) >= 6 and shorter in longer:
         return True
     return False
 
@@ -1003,6 +1063,8 @@ def main() -> int:
                     uqk = user_queue_key(addr)
 
                     for outage in new_outages:
+                        if not matches_city(outage, addr):
+                            continue
                         if not matches_street(outage, street_id, street_name):
                             continue
                         if not matches_building(outage, str(house)):
