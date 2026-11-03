@@ -508,15 +508,30 @@ def _buckets_for_addr_day(db, addr: dict, ymd: str) -> Dict[str, List[Tuple[str,
     if city:
         q["city_name"] = {"$regex": f"^{city}$", "$options": "i"}
     buckets = {"emergency": [], "repair": [], "other": []}
-    for doc in db["outages"].find(q).limit(200):
+
+    # «Сьогодні» в Києві — інтервали, що вже закінчились, не показуємо
+    try:
+        from zoneinfo import ZoneInfo
+        now_k = datetime.now(ZoneInfo("Europe/Kyiv"))
+    except Exception:
+        now_k = datetime.now(timezone.utc) + timedelta(hours=2)
+    today_ymd = now_k.strftime("%Y-%m-%d")
+    now_hm = now_k.strftime("%H:%M")
+
+    for doc in db["outages"].find(q).limit(300):
         de = str(doc.get("dateEvent") or doc.get("date_from") or "")
         dp = str(doc.get("datePlanIn") or doc.get("date_to") or "")
         if not (de.startswith(ymd) or dp.startswith(ymd)):
             continue
-        ds = (doc.get("street_name") or "").strip().lower()
+        ds = (doc.get("street_name") or "").strip()
         sn = _norm_street(street)
         dn = _norm_street(ds)
-        if sn and dn and not (sn == dn or sn in dn or dn in sn):
+        if sn and dn:
+            if sn != dn:
+                shorter, longer = (sn, dn) if len(sn) <= len(dn) else (dn, sn)
+                if not (len(shorter) >= 6 and shorter in longer):
+                    continue
+        elif sn or dn:
             continue
         buildings = (doc.get("buildingNames") or doc.get("buildings") or "").strip()
         if house and buildings:
@@ -533,8 +548,12 @@ def _buckets_for_addr_day(db, addr: dict, ymd: str) -> Dict[str, List[Tuple[str,
             continue
         start = de[11:16] if len(de) >= 16 else ""
         end = dp[11:16] if len(dp) >= 16 else ""
-        if start and end:
-            buckets[kind].append((start, end))
+        if not (start and end):
+            continue
+        # Минулий інтервал на сьогодні (напр. 02:22–17:00 після 17:00) — ігнор
+        if ymd == today_ymd and end <= now_hm:
+            continue
+        buckets[kind].append((start, end))
     for k in buckets:
         buckets[k] = _merge_intervals(buckets[k])
     return buckets
@@ -952,67 +971,75 @@ def main() -> int:
                 filtered.append(o)
             new_outages = filtered
 
-            # Зміна datePlanIn: по soft_fp АБО по id запису в API
+            # Старий id → завжди звіряємо час (datePlanIn / dateEvent) з кешем і Mongo
             plan_updates: List[dict] = []
             new_fp_set = {content_fingerprint(o) for o in new_outages}
+            seen_plan_oids: set = set()
+
+            def _mark_plan_update(o: dict, old_plan: str, reason: str) -> None:
+                oid = make_outage_key(o)
+                if oid in seen_plan_oids:
+                    return
+                if content_fingerprint(o) in new_fp_set:
+                    return  # уже піде як «нова» подія
+                oo = dict(o)
+                oo["_plan_updated"] = True
+                oo["_plan_was"] = (old_plan or "")[:16]
+                oo["_plan_reason"] = reason
+                plan_updates.append(oo)
+                seen_plan_oids.add(oid)
+                log.info(
+                    "otg=%s id=%s plan change: %s → %s (%s)",
+                    otg_id,
+                    o.get("id"),
+                    (old_plan or "")[:16],
+                    (o.get("datePlanIn") or "")[:16],
+                    reason,
+                )
+
             for o in outages:
                 if not should_notify_outage(o):
                     continue
-                fp = content_fingerprint(o)
-                if fp in new_fp_set:
+                sid = o.get("id")
+                if sid is None:
                     continue
-                soft = soft_fingerprint(o)
+                src = o.get("_source") or "accidents"
                 oid = make_outage_key(o)
+                soft = soft_fingerprint(o)
                 new_plan = (o.get("datePlanIn") or "")[:16]
-                old_plan = (
-                    prev_plans_id.get(oid)
-                    or prev_plans.get(soft)
-                    or ""
-                )[:16]
-                # відома подія (id або soft уже бачили) + змінився план
-                known = oid in prev_plans_id or soft in prev_plans or soft in prev_soft or fp in prev_fps
-                if known and old_plan and new_plan and old_plan != new_plan:
-                    oo = dict(o)
-                    oo["_plan_updated"] = True
-                    oo["_plan_was"] = old_plan
-                    plan_updates.append(oo)
-                elif known and not old_plan and new_plan:
-                    # перший раз бачимо план, але fingerprint вже був —
-                    # порівняти з тим, що в Mongo outages (якщо є старий datePlanIn)
-                    pass
+                new_event = (o.get("dateEvent") or "")[:16]
 
-            # Додатково: якщо в full-колекції outages інший datePlanIn ніж в API — теж update
-            extra_plan: List[dict] = []
-            if not plan_updates:
+                # 1) Кеш plan_by_id (найшвидше)
+                old_plan_cache = (prev_plans_id.get(oid) or prev_plans.get(soft) or "")[:16]
+
+                # 2) Документ у Mongo по тому самому source_id
+                old_plan_mongo = ""
+                old_event_mongo = ""
                 try:
-                    for o in outages:
-                        if not should_notify_outage(o):
-                            continue
-                        if content_fingerprint(o) in new_fp_set:
-                            continue
-                        sid = o.get("id")
-                        src = o.get("_source") or "accidents"
-                        if sid is None:
-                            continue
-                        doc = outages_full.find_one(
-                            {"source_id": sid, "source": src}
-                        ) or outages_full.find_one({"source_id": sid})
-                        if not doc:
-                            continue
-                        old_plan = (doc.get("datePlanIn") or "")[:16]
-                        new_plan = (o.get("datePlanIn") or "")[:16]
-                        if old_plan and new_plan and old_plan != new_plan:
-                            oo = dict(o)
-                            oo["_plan_updated"] = True
-                            oo["_plan_was"] = old_plan
-                            extra_plan.append(oo)
-                except Exception as e:
-                    log.warning("plan compare via outages col: %s", e)
-            if extra_plan:
-                seen_soft = {soft_fingerprint(o) for o in plan_updates}
-                for o in extra_plan:
-                    if soft_fingerprint(o) not in seen_soft:
-                        plan_updates.append(o)
+                    doc = outages_full.find_one(
+                        {"source_id": sid, "source": src}
+                    ) or outages_full.find_one({"source_id": sid})
+                except Exception:
+                    doc = None
+                if doc:
+                    old_plan_mongo = (doc.get("datePlanIn") or "")[:16]
+                    old_event_mongo = (doc.get("dateEvent") or "")[:16]
+
+                # Є старий id (у кеші або в Mongo) → перевіряємо час
+                is_old_id = bool(doc) or oid in prev_plans_id or soft in prev_plans
+                if not is_old_id:
+                    continue
+
+                old_plan = old_plan_mongo or old_plan_cache
+                if old_plan and new_plan and old_plan != new_plan:
+                    _mark_plan_update(o, old_plan, "datePlanIn")
+                elif old_event_mongo and new_event and old_event_mongo != new_event:
+                    # змінили годину старту на тому ж id
+                    _mark_plan_update(
+                        o,
+                        old_plan_mongo or old_plan_cache or old_event_mongo,
+                        "dateEvent",
+                    )
 
             if plan_updates:
                 log.info("otg=%s plan_updates=%s", otg_id, len(plan_updates))
@@ -1048,6 +1075,36 @@ def main() -> int:
                         outages_full.bulk_write(ops, ordered=False)
                     except Exception as e:
                         log.warning("bulk outages otg=%s: %s", otg_id, e)
+                # Прибрати «сиріт»: старі id, яких уже немає в API (02:22–17:00 після заміни на 16:42–23:00)
+                try:
+                    active_pairs = {
+                        (
+                            (o.get("_source") or "accidents"),
+                            o.get("id"),
+                        )
+                        for o in outages
+                        if o.get("id") is not None
+                    }
+                    stale_ids = []
+                    for doc in outages_full.find(
+                        {"otg_id": int(otg_id)},
+                        {"_id": 1, "source": 1, "source_id": 1},
+                    ):
+                        pair = (doc.get("source") or "accidents", doc.get("source_id"))
+                        if pair not in active_pairs:
+                            stale_ids.append(doc["_id"])
+                    if stale_ids:
+                        # пачками, щоб не роздувати $in
+                        for i in range(0, len(stale_ids), 500):
+                            chunk = stale_ids[i : i + 500]
+                            outages_full.delete_many({"_id": {"$in": chunk}})
+                        log.info(
+                            "otg=%s stale outages deleted=%s",
+                            otg_id,
+                            len(stale_ids),
+                        )
+                except Exception as e:
+                    log.warning("stale outages cleanup otg=%s: %s", otg_id, e)
 
             matched_fps: set = set()
             if new_outages:
@@ -1128,14 +1185,18 @@ def main() -> int:
             soft_stored = merge_soft_fps(current_soft, prev_soft, SOFT_FPS_MAX)
             plan_by_soft = {}
             plan_by_id = {}
+            event_by_id = {}
             for o in outages:
                 soft = soft_fingerprint(o)
                 plan = (o.get("datePlanIn") or "")[:16]
+                ev = (o.get("dateEvent") or "")[:16]
                 oid = make_outage_key(o)
                 if soft and plan:
                     plan_by_soft[soft] = plan
                 if oid and plan:
                     plan_by_id[oid] = plan
+                if oid and ev:
+                    event_by_id[oid] = ev
             outages_col.update_one(
                 {"_id": cache_key},
                 {
@@ -1145,6 +1206,7 @@ def main() -> int:
                         "soft_fps": soft_stored,
                         "plan_by_soft": plan_by_soft,
                         "plan_by_id": plan_by_id,
+                        "event_by_id": event_by_id,
                         "updated_at": datetime.now(timezone.utc),
                         "count": len(current_ids),
                     }
