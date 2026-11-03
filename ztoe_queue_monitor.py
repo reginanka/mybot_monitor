@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-Тижнева перевірка черг ГПВ для адрес підписників бота Житомиробленерго.
+Тижнева перевірка черг ГПВ.
 
-Читає колекцію queue_directory (унікальні адреси з чергами),
-оновлює чергу з URL з секрету ZTOE_QUEUE_URL,
-якщо змінилася — сповіщає користувачів з users (notify=true) і оновлює їх addresses.
+ВАЖЛИВО: логіка пошуку черги = копія bot/queue_client.py (/queue).
+Ті самі _score_match / resolve_queue_step / find_queue / apply_house_to_result.
+Не «майже як бот» — той самий алгоритм.
 
-Secrets / env:
-  MONGO_URI  — MongoDB connection string
-  MONGO_DB   — назва БД (напр. vidkluchennya)
-  ZTOE_BOT_TOKEN — токен бота для сповіщень користувачам і логів
+Secrets: MONGO_URI, MONGO_DB, ZTOE_BOT_TOKEN
+Optional: ZTOE_QUEUE_URL (default unhooking-search.php), ZTOE_REQUEST_PAUSE
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -38,9 +35,11 @@ log = logging.getLogger("ztoe_queue_monitor")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-BASE = os.getenv("ZTOE_QUEUE_URL") or os.getenv("QUEUE_SEARCH_URL")
-if not BASE:
-    raise SystemExit("Немає ZTOE_QUEUE_URL (URL сторінки пошуку черг)")
+BASE = (
+    os.getenv("ZTOE_QUEUE_URL")
+    or os.getenv("QUEUE_SEARCH_URL")
+    or "https://www.ztoe.com.ua/unhooking-search.php"
+)
 REQUEST_PAUSE_SEC = float(os.getenv("ZTOE_REQUEST_PAUSE", "0.8"))
 
 HEADERS = {
@@ -53,7 +52,9 @@ HEADERS = {
 }
 
 
-# ---------- helpers: matching / parse (як у боті) ----------
+# =============================================================================
+# === ПОЧАТОК: логіка з bot/queue_client.py (sync-порт, без змін алгоритму) ===
+# =============================================================================
 
 def _norm(s: str) -> str:
     s = (s or "").lower().strip()
@@ -64,20 +65,6 @@ def _norm(s: str) -> str:
             s = s[len(p) :].strip()
     s = re.sub(r"^(вулиця|провулок)\s+", "", s)
     return s
-
-
-def address_key(otg_name: str, city_name: str, street_name: str) -> str:
-    raw = f"{_norm(otg_name)}|{_norm(city_name)}|{_norm(street_name)}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-
-
-def queue_fingerprint(queue: str, subqueue: str, houses: str, note: str) -> str:
-    return "|".join([
-        (queue or "").strip(),
-        (subqueue or "").strip(),
-        (houses or "").strip(),
-        (note or "").strip(),
-    ])
 
 
 def _options(soup: BeautifulSoup, name: str) -> list[tuple[str, str]]:
@@ -94,6 +81,7 @@ def _options(soup: BeautifulSoup, name: str) -> list[tuple[str, str]]:
 
 
 def _score_match(query: str, option_text: str) -> float:
+    """0 = немає збігу, 1 = точний, 0.5..0.99 = частковий."""
     q = _norm(query)
     t = _norm(option_text)
     if not q or not t:
@@ -101,6 +89,7 @@ def _score_match(query: str, option_text: str) -> float:
     if q == t:
         return 1.0
     if q in t or t in q:
+        # коротший запит у довшій назві — ок, але не ідеал
         return 0.85 - 0.1 * abs(len(q) - len(t)) / max(len(q), len(t), 1)
     q_words = set(re.findall(r"[а-яіїєґa-z0-9']+", q, re.I))
     t_words = set(re.findall(r"[а-яіїєґa-z0-9']+", t, re.I))
@@ -129,68 +118,102 @@ def _best_match(options: list[tuple[str, str]], query: str) -> Optional[tuple[st
     return matches[0][0], matches[0][1]
 
 
+def _post(client: httpx.Client, data: dict) -> BeautifulSoup:
+    if REQUEST_PAUSE_SEC > 0:
+        time.sleep(REQUEST_PAUSE_SEC)
+    r = client.post(BASE, data=data, headers=HEADERS)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+
+def _directory_unavailable(soup: BeautifulSoup) -> bool:
+    """
+    True, якщо форма довідника черг тимчасово вимкнена / порожня
+    (немає списку РЕМ), а не «адреса не знайдена».
+    """
+    rems = _options(soup, "rem_id")
+    if rems:
+        return False
+    # немає select rem_id або він порожній
+    text = soup.get_text(" ", strip=True).lower()
+    # якщо сторінка взагалі без форми пошуку
+    if "unhooking" in text or "черг" in text or "рем" in text:
+        return True
+    # коротка заглушка / технічна сторінка
+    if len(text) < 500 or "select" not in str(soup).lower():
+        return True
+    return True  # порожній список РЕМ = довідник недоступний
+
+
 def _parse_result_table(soup: BeautifulSoup) -> list[dict]:
-    """Усі рядки таблиці результату (не лише перший)."""
-    results: list[dict] = []
+    """Парсить УСІ рядки результату (на одній вулиці може бути багато черг по будинках)."""
+    results = []
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
+        header_idx = None
+        headers = []
         for i, row in enumerate(rows):
-            headers = [c.get_text(strip=True).lower() for c in row.find_all(["th", "td"])]
-            if not any("черг" in h for h in headers):
+            cols_raw = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if not cols_raw or cols_raw[0] != "РЕМ":
                 continue
+            if not any(c == "Черга" for c in cols_raw):
+                continue
+            header_idx = i
+            headers = [c.lower() for c in cols_raw]
+            break
+        if header_idx is None:
+            continue
 
-            def idx(*needles: str) -> int | None:
-                for j, h in enumerate(headers):
-                    if any(n in h for n in needles):
+        def idx(*names):
+            for j, h in enumerate(headers):
+                for n in names:
+                    if n in h:
                         return j
-                return None
+            return None
 
-            i_queue = idx("черг")
-            i_sub = idx("підчерг", "подчерг")
-            i_houses = idx("будинк")
-            i_note = idx("приміт")
-            i_rem = idx("рем")
-            i_city = idx("населен")
-            i_street = idx("назв", "вулиц")
+        i_rem = idx("рем")
+        i_city = idx("населен")
+        i_street = idx("назв", "вулиц")
+        i_houses = idx("будинк")
+        i_queue = idx("черга")
+        i_sub = idx("підчерг")
+        i_note = idx("приміт")
 
-            for r in rows[i + 1 :]:
-                cols = [c.get_text(strip=True) for c in r.find_all(["td", "th"])]
-                if len(cols) < 3:
-                    continue
-                if cols and cols[0] == "РЕМ":
-                    continue
-                if not any(cols):
-                    continue
-
-                rem = cols[i_rem] if i_rem is not None and i_rem < len(cols) else ""
-                city = cols[i_city] if i_city is not None and i_city < len(cols) else ""
-                street = cols[i_street] if i_street is not None and i_street < len(cols) else ""
-                houses = cols[i_houses] if i_houses is not None and i_houses < len(cols) else ""
-                queue = cols[i_queue] if i_queue is not None and i_queue < len(cols) else ""
-                subqueue = cols[i_sub] if i_sub is not None and i_sub < len(cols) else ""
-                note = cols[i_note] if i_note is not None and i_note < len(cols) else ""
-
-                if _is_time_token(houses) or _is_time_token(city) or _is_time_token(street):
-                    continue
-                if not rem and not city and not street:
-                    continue
-                if _is_time_token(queue) or _is_time_token(subqueue):
-                    continue
-                # рядок сітки черг без адреси
-                if not street and not houses and re.match(r"^[\d.]+$", (rem or "").strip()):
-                    continue
-
-                results.append({
-                    "rem": rem,
-                    "city": city,
-                    "street": street,
-                    "houses": houses,
-                    "queue": queue,
-                    "subqueue": subqueue,
-                    "note": note,
-                })
-            if results:
-                return results
+        for row in rows[header_idx + 1 :]:
+            cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if len(cols) < 5 or cols[0] == "РЕМ":
+                continue
+            if not any(cols):
+                continue
+            rem = cols[i_rem] if i_rem is not None and i_rem < len(cols) else ""
+            city = cols[i_city] if i_city is not None and i_city < len(cols) else ""
+            street = cols[i_street] if i_street is not None and i_street < len(cols) else ""
+            houses = cols[i_houses] if i_houses is not None and i_houses < len(cols) else ""
+            queue = cols[i_queue] if i_queue is not None and i_queue < len(cols) else ""
+            subqueue = cols[i_sub] if i_sub is not None and i_sub < len(cols) else ""
+            note = cols[i_note] if i_note is not None and i_note < len(cols) else ""
+            # Сітка графіка на тій же сторінці: рядок зі слотами 00:00-00:30 …
+            # і рядки «1 / 1.1 / 1.2» без адреси — пропускаємо.
+            if _is_time_token(houses) or _is_time_token(city) or _is_time_token(street):
+                continue
+            if not rem and not city and not street:
+                continue
+            if _is_time_token(queue) or _is_time_token(subqueue):
+                continue
+            # рядок сітки черг: rem="1"/"1.2", без вулиці й будинків
+            if not street and not houses and re.match(r"^[\d.]+$", (rem or "").strip()):
+                continue
+            results.append({
+                "rem": rem,
+                "city": city,
+                "street": street,
+                "houses": houses,
+                "queue": queue,
+                "subqueue": subqueue,
+                "note": note,
+            })
+        if results:
+            return results
     return results
 
 
@@ -200,6 +223,7 @@ _TIME_TOKEN_RE = re.compile(
 
 
 def _is_time_token(s: str) -> bool:
+    """Слот графіка (01:00-01:30), не номер будинку."""
     return bool(_TIME_TOKEN_RE.match((s or "").strip()))
 
 
@@ -223,38 +247,36 @@ def _house_in_list(house: str, houses_str: str) -> bool:
         t = tok.strip().lower().replace(" ", "")
         if t == h or t.rstrip(".") == h.rstrip("."):
             return True
-        # діапазони типу 1-5 / 10–20
-        m = re.match(r"^(\d+)\s*[-–—]\s*(\d+)$", t)
-        if m and h.isdigit():
-            lo, hi = int(m.group(1)), int(m.group(2))
-            if lo <= int(h) <= hi:
-                return True
     return False
 
 
 def _aggregate_street_rows(rows: list[dict]) -> dict:
-    """Збирає всі будинки вулиці + house → row."""
+    """
+    З кількох рядків однієї вулиці збирає всі будинки і мапінг house → queue row.
+    Якщо будинків немає — бере перший рядок як раніше.
+    """
     if not rows:
-        return {"error": "no_rows", "message": "Немає запису черги для адреси"}
+        return {"error": "Записів черги не знайдено"}
 
-    all_houses: list[str] = []
-    seen_h: set[str] = set()
-    house_to_row: dict[str, dict] = {}
+    all_houses = []
+    seen_h = set()
+    house_to_row = {}
     for row in rows:
         tokens = _split_house_tokens(row.get("houses") or "")
         if not tokens:
+            # рядок без номерів — запасний варіант «на всю вулицю»
             continue
         for tok in tokens:
             key = tok.strip().lower().replace(" ", "")
             if key not in seen_h:
                 seen_h.add(key)
                 all_houses.append(tok.strip())
+            # перший рядок, де зустрівся цей будинок, вважаємо джерелом черги
             if key not in house_to_row:
                 house_to_row[key] = row
 
     base = rows[0]
     if not all_houses:
-        # вся вулиця одним рядком / без номерів
         return {
             "ok": True,
             "queue": base.get("queue") or "",
@@ -266,9 +288,9 @@ def _aggregate_street_rows(rows: list[dict]) -> dict:
             "matched_street": base.get("street") or "",
             "rows": rows,
             "house_map": {},
-            "all_houses": [],
         }
 
+    # унікальні черги серед рядків
     return {
         "ok": True,
         "queue": base.get("queue") or "",
@@ -281,100 +303,66 @@ def _aggregate_street_rows(rows: list[dict]) -> dict:
         "rows": rows,
         "all_houses": all_houses,
         "house_map": house_to_row,
-        "multi_queue": len({
-            ((r.get("queue") or "").strip(), (r.get("subqueue") or "").strip())
-            for r in rows
-        }) > 1,
+        "multi_queue": len({(
+            (r.get("queue") or "").strip(),
+            (r.get("subqueue") or "").strip(),
+        ) for r in rows}) > 1,
     }
 
 
-def apply_house_to_info(info: dict, house: str | None) -> dict:
-    """
-    Якщо в користувача є номер будинку — беремо чергу саме для нього.
-    Якщо будинок не входить у жоден список довідника — це «немає черги / не вимикають»
-    (не беремо чужий рядок на кшталт «120 · непобутові»).
-    """
-    if not info.get("ok"):
-        return info
-    house = (house or "").strip()
-    if not house:
-        return info
-
-    # 1) точний ключ у house_map
-    hmap = info.get("house_map") or {}
-    key = house.lower().replace(" ", "")
-    row = hmap.get(key)
-    if row is None:
-        # 2) пошук через _house_in_list (діапазони тощо)
-        for r in info.get("rows") or []:
-            if _house_in_list(house, r.get("houses") or ""):
-                row = r
-                break
-
-    out = dict(info)
-    out["house"] = house
-    if row is not None:
-        out["queue"] = row.get("queue") or ""
-        out["subqueue"] = row.get("subqueue") or ""
-        out["houses"] = row.get("houses") or house
-        out["note"] = row.get("note") or ""
-        out["house_matched"] = True
-        return out
-
-    # будинок не знайдено в довіднику → не присвоюємо чужу чергу
-    out["queue"] = "не вимикають, крім аварійних"
-    out["subqueue"] = ""
-    out["houses"] = house
-    out["note"] = "номер не в списках черг довідника"
-    out["house_matched"] = False
-    return out
-
-
-def fetch_queue(
+def resolve_queue_step(
     otg_name: str,
     city_name: str,
     street_name: str,
-    *,
-    rem_id: str | None = None,
-    city_id: str | None = None,
-    street_id: str | None = None,
+    rem_id: str = None,
+    city_id: str = None,
+    street_id: str = None,
 ) -> dict:
     """
-    Той самий шлях, що /queue у боті (queue_client.resolve_queue_step + find_queue):
-    - спочатку РЕМ з otg_name;
-    - якщо місто не знайдено — скан по ВСІХ РЕМ;
-    - exact match ≥0.99 має пріоритет;
-    - черга по вулиці, далі apply_house_to_info по будинку.
+    Покроковий пошук черги.
+    Повертає один з варіантів:
+      need_choice: "rem" | "city" | "street" + candidates: [(id, name), ...]
+      ok: queue info
+      error: повідомлення
     """
-    with httpx.Client(timeout=25, follow_redirects=True, headers=HEADERS) as client:
-        r = client.post(BASE, data={})
-        r.raise_for_status()
-        soup0 = BeautifulSoup(r.text, "html.parser")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
+    }
+    with httpx.Client(timeout=25, follow_redirects=True, headers=headers) as client:
+        # --- РЕМ + населений пункт ---
+        # У API power-on РЕМ часто «кривий» (Коростень → Хорошівський).
+        # Тому: спочатку пробуємо otg_name, якщо не вийшло — шукаємо місто по всіх РЕМ.
+        soup0 = _post(client, {})
         rems = _options(soup0, "rem_id")
         if not rems:
             return {
-                "error": "directory_unavailable",
+                "error": (
+                    "Довідник черг тимчасово недоступний "
+                    "(пошук адрес на сайті Житомиробленерго вимкнено). "
+                    "Спробуй пізніше: /queue"
+                ),
                 "temporary": True,
-                "message": "Довідник черг тимчасово недоступний (порожній список РЕМ)",
             }
 
-        rem_name = otg_name or ""
-        city_label = city_name or ""
+        rem_name = otg_name
+        city_label = city_name
 
         def find_city_in_rem(rid: str):
-            time.sleep(REQUEST_PAUSE_SEC)
-            rr = client.post(BASE, data={"rem_id": rid})
-            rr.raise_for_status()
-            soup = BeautifulSoup(rr.text, "html.parser")
+            soup = _post(client, {"rem_id": rid})
             cities = _options(soup, "naspunkt_id")
             if not cities:
-                return soup, [], cities
+                return None, [], soup
             matches = _filter_matches(cities, city_name, min_score=0.5)
             return soup, matches, cities
 
-        # --- REM + city (як у боті) ---
         if not rem_id:
             rem_query = re.sub(r"\s*рем\s*$", "", otg_name or "", flags=re.I).strip()
+            # ігноруємо службові/загальні назви на кшталт АТ "Житомиробленерго"
             bad_rem = (
                 not rem_query
                 or "житомиробленерго" in rem_query.lower()
@@ -387,144 +375,172 @@ def fetch_queue(
             found_via_otg = False
             if use_rem and not (len(use_rem) > 1 and not exact_rem):
                 cand_rem_id, cand_rem_name = use_rem[0][0], use_rem[0][1]
-                _, city_matches, _ = find_city_in_rem(cand_rem_id)
-                if city_matches:
+                if not city_id:
+                    _, city_matches, _ = find_city_in_rem(cand_rem_id)
                     exact_c = [m for m in city_matches if m[2] >= 0.99]
                     use_c = exact_c if exact_c else city_matches
-                    if len(use_c) == 1 or (exact_c and len(exact_c) == 1):
-                        city_id = use_c[0][0]
-                        city_label = use_c[0][1]
+                    if use_c and not (len(use_c) > 1 and (not exact_c or len(exact_c) > 1)):
                         rem_id, rem_name = cand_rem_id, cand_rem_name
+                        city_id, city_label = use_c[0][0], use_c[0][1]
                         found_via_otg = True
-                    elif exact_c:
-                        # кілька exact — беремо найкращий score (крону треба один вибір)
-                        exact_c.sort(key=lambda x: -x[2])
-                        city_id, city_label = exact_c[0][0], exact_c[0][1]
-                        rem_id, rem_name = cand_rem_id, cand_rem_name
-                        found_via_otg = True
-                    else:
-                        use_c.sort(key=lambda x: -x[2])
-                        if use_c[0][2] >= 0.85:
-                            city_id, city_label = use_c[0][0], use_c[0][1]
-                            rem_id, rem_name = cand_rem_id, cand_rem_name
-                            found_via_otg = True
+                    elif use_c and len(use_c) > 1:
+                        # кілька міст у «правильному» РЕМ — хай користувач обере
+                        pool = exact_c if len(exact_c) > 1 else use_c
+                        return {
+                            "need_choice": "city",
+                            "candidates": [(m[0], m[1]) for m in pool[:20]],
+                            "rem_id": cand_rem_id,
+                            "matched_rem": cand_rem_name,
+                            "otg_name": otg_name,
+                            "city_name": city_name,
+                            "street_name": street_name,
+                        }
                 else:
                     rem_id, rem_name = cand_rem_id, cand_rem_name
                     found_via_otg = True
+            elif use_rem and len(use_rem) > 1 and not exact_rem:
+                # неоднозначний РЕМ за otg — спитаємо лише якщо не знайдемо місто інакше
+                ambiguous_rems = use_rem
 
             if not found_via_otg and not city_id:
-                # скан усіх РЕМ по назві міста (кривий otg з power-on API)
-                cross: list[tuple] = []
-                for rid, rname in rems:
-                    _, city_matches, _ = find_city_in_rem(rid)
+                # Fallback: шукаємо населений пункт у всіх РЕМ довідника (паралельно)
+                
+                def _scan(rid_rname):
+                    rid, rname = rid_rname
+                    try:
+                        _, city_matches, _ = find_city_in_rem(rid)
+                    except Exception:
+                        return []
+                    out = []
                     for cid, cname, sc in city_matches:
                         if sc >= 0.7:
-                            cross.append((sc, rid, rname, cid, cname))
+                            out.append((sc, rid, rname, cid, cname))
+                    return out
+
+                cross = []
+                for rr in rems:
+                    cross.extend(_scan(rr))
                 cross.sort(key=lambda x: -x[0])
                 if not cross:
                     return {
-                        "error": "city_not_found",
-                        "message": f"Населений пункт «{city_name}» не знайдено в довіднику черг",
+                        "error": (
+                            f"Населений пункт «{city_name}» не знайдено в довіднику черг"
+                            + (f" (API РЕМ: {otg_name})" if otg_name else "")
+                        ),
                     }
+                # точні збіги назви
                 exact_cross = [x for x in cross if x[0] >= 0.99]
                 pool = exact_cross if exact_cross else cross[:15]
-                # унікальні (rem, city)
-                uniq = []
-                seen = set()
-                for sc, rid, rname, cid, cname in pool:
-                    key = (rid, cid)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    uniq.append((sc, rid, rname, cid, cname))
-                if len(uniq) == 1 or (exact_cross and len({(x[1], x[3]) for x in exact_cross}) == 1):
-                    sc, rem_id, rem_name, city_id, city_label = uniq[0]
+                # унікальні пари rem+city
+                if len(pool) == 1 or (exact_cross and len({(x[1], x[3]) for x in exact_cross}) == 1):
+                    sc, rem_id, rem_name, city_id, city_label = pool[0]
                 else:
-                    # кілька НП — беремо найкращий exact, інакше top score
-                    pick = uniq[0]
-                    for item in uniq:
-                        if item[0] >= 0.99 and _norm(item[4]) == _norm(city_name):
-                            pick = item
+                    # кілька варіантів — показуємо як вибір «місто (РЕМ)»
+                    seen = set()
+                    cands = []
+                    for sc, rid, rname, cid, cname in pool:
+                        key = (rid, cid)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        cands.append((f"{rid}|{cid}", f"{cname} ({rname})"))
+                        if len(cands) >= 20:
                             break
-                    sc, rem_id, rem_name, city_id, city_label = pick
-                    log.info(
-                        "ambiguous city «%s»: picked %s (%s) score=%.2f among %s",
-                        city_name, city_label, rem_name, sc, len(uniq),
-                    )
+                    return {
+                        "need_choice": "city",
+                        "candidates": cands,
+                        "rem_id": None,  # прийде composite id
+                        "matched_rem": None,
+                        "otg_name": otg_name,
+                        "city_name": city_name,
+                        "street_name": street_name,
+                        "composite_city_choice": True,
+                    }
+            elif not found_via_otg and not rem_id:
+                return {"error": f"РЕМ не знайдено в довіднику черг: {otg_name}"}
+        else:
+            rem_name = otg_name or rem_name
 
-        if not city_id and rem_id:
+        # city_id уже може бути заданий (у т.ч. після вибору користувача)
+        if not city_id:
             _, city_matches, _ = find_city_in_rem(rem_id)
             exact = [m for m in city_matches if m[2] >= 0.99]
             use = exact if exact else city_matches
             if not use:
                 return {
-                    "error": "city_not_found",
-                    "message": f"Населений пункт «{city_name}» не знайдено в РЕМ {rem_name}",
+                    "error": f"Населений пункт не знайдено: {city_name}",
+                    "matched_rem": rem_name,
+                    "rem_id": rem_id,
                 }
-            use.sort(key=lambda x: -x[2])
+            if len(use) > 1 and (not exact or len(exact) > 1):
+                pool = exact if len(exact) > 1 else use
+                return {
+                    "need_choice": "city",
+                    "candidates": [(m[0], m[1]) for m in pool[:20]],
+                    "rem_id": rem_id,
+                    "matched_rem": rem_name,
+                    "otg_name": otg_name,
+                    "city_name": city_name,
+                    "street_name": street_name,
+                }
             city_id, city_label = use[0][0], use[0][1]
+        else:
+            city_label = city_name
 
-        if not rem_id or not city_id:
-            return {
-                "error": "rem_or_city_missing",
-                "message": f"Не вдалося визначити РЕМ/місто для {otg_name} / {city_name}",
-            }
-
-        # --- street ---
+        # --- Вулиця ---
         if not street_id:
-            time.sleep(REQUEST_PAUSE_SEC)
-            rr = client.post(BASE, data={"rem_id": rem_id, "naspunkt_id": city_id})
-            rr.raise_for_status()
-            soup = BeautifulSoup(rr.text, "html.parser")
+            soup = _post(client, {"rem_id": rem_id, "naspunkt_id": city_id})
             streets = _options(soup, "vulica_id")
             if not streets:
                 return {
-                    "error": "streets_empty",
+                    "error": (
+                        "Довідник черг тимчасово недоступний "
+                        "(список вулиць порожній). Спробуй пізніше: /queue"
+                    ),
                     "temporary": True,
-                    "message": "Список вулиць порожній (довідник тимчасово недоступний)",
                     "matched_rem": rem_name,
                     "matched_city": city_label,
+                    "rem_id": rem_id,
+                    "city_id": city_id,
                 }
-            matches = _filter_matches(streets, street_name, min_score=0.5)
+            matches = _filter_matches(streets, street_name, min_score=0.45)
             exact = [m for m in matches if m[2] >= 0.99]
             use = exact if exact else matches
             if not use:
                 return {
-                    "error": "street_not_found",
-                    "message": f"Вулицю не знайдено: {street_name}",
+                    "error": f"Вулицю не знайдено: {street_name}",
                     "matched_rem": rem_name,
                     "matched_city": city_label,
+                    "rem_id": rem_id,
+                    "city_id": city_id,
                 }
-            # якщо кілька — віддаємо перевагу exact з найвищим score; інакше top
-            use.sort(key=lambda x: -x[2])
-            if len(use) > 1 and not exact:
-                log.info(
-                    "ambiguous street «%s» in %s: candidates=%s → %s",
-                    street_name,
-                    city_label,
-                    [(m[1], round(m[2], 2)) for m in use[:5]],
-                    use[0][1],
-                )
+            if len(use) > 1 and (not exact or len(exact) > 1):
+                pool = exact if len(exact) > 1 else use
+                return {
+                    "need_choice": "street",
+                    "candidates": [(m[0], m[1]) for m in pool[:20]],
+                    "rem_id": rem_id,
+                    "city_id": city_id,
+                    "matched_rem": rem_name,
+                    "matched_city": city_label,
+                    "otg_name": otg_name,
+                    "city_name": city_name,
+                    "street_name": street_name,
+                }
             street_id, street_label = use[0][0], use[0][1]
         else:
             street_label = street_name
 
-        time.sleep(REQUEST_PAUSE_SEC)
-        rr = client.post(
-            BASE,
-            data={
-                "rem_id": rem_id,
-                "naspunkt_id": city_id,
-                "vulica_id": street_id,
-            },
-        )
-        rr.raise_for_status()
-        soup = BeautifulSoup(rr.text, "html.parser")
+        # --- Результат черги ---
+        soup = _post(client, {
+            "rem_id": rem_id,
+            "naspunkt_id": city_id,
+            "vulica_id": street_id,
+        })
         rows = _parse_result_table(soup)
         if not rows:
             return {
-                "error": "no_queue_rows",
-                "message": "Записів черги не знайдено для цієї адреси",
+                "error": "Записів черги не знайдено для цієї адреси",
                 "matched_rem": rem_name,
                 "matched_city": city_label,
                 "matched_street": street_label,
@@ -533,78 +549,204 @@ def fetch_queue(
         agg = _aggregate_street_rows(rows)
         return {
             **agg,
-            "ok": True,
-            "matched_rem": rem_name,
-            "matched_city": city_label,
-            "matched_street": street_label,
+            "matched_rem": rem_name if isinstance(rem_name, str) and rem_name else agg.get("matched_rem", ""),
+            "matched_city": city_label if isinstance(city_label, str) and city_label else agg.get("matched_city", ""),
+            "matched_street": street_label if isinstance(street_label, str) and street_label else agg.get("matched_street", ""),
             "rem_id": rem_id,
             "city_id": city_id,
             "street_id": street_id,
         }
 
 
+def find_queue(otg_name: str, city_name: str, street_name: str) -> dict:
+    """Сумісність зі старим API: одразу найкращий збіг або error."""
+    result = resolve_queue_step(otg_name, city_name, street_name)
+    if result.get("need_choice"):
+        # беремо перший кандидат і добиваємо
+        cands = result["candidates"]
+        if result["need_choice"] == "rem":
+            return resolve_queue_step(
+                otg_name, city_name, street_name, rem_id=cands[0][0]
+            )
+        if result["need_choice"] == "city":
+            return resolve_queue_step(
+                otg_name, city_name, street_name,
+                rem_id=result.get("rem_id"), city_id=cands[0][0],
+            )
+        if result["need_choice"] == "street":
+            return resolve_queue_step(
+                otg_name, city_name, street_name,
+                rem_id=result.get("rem_id"), city_id=result.get("city_id"),
+                street_id=cands[0][0],
+            )
+    if result.get("ok"):
+        return result
+    return result
 
-def _short_queue_label(queue: str = "", subqueue: str = "", note: str = "") -> str:
-    """Короткий рядок черги для «було / стало»."""
-    q = (queue or "").strip()
-    sq = (subqueue or "").strip()
-    q_low = q.lower()
-    if any(m in q_low for m in ("не вимикається", "не вимикають", "не відключається", "не відключають")):
-        base = "не вимикають, крім аварійних"
-    elif sq and sq != q and len(sq) < 40 and re.match(r"^[\d.]+$", sq):
-        base = f"черга {q}, підчерга {sq}"
-    elif re.match(r"^[\d.]+$", q):
-        base = f"черга {q}" + (f", підчерга {sq}" if sq and re.match(r"^[\d.]+$", sq) else "")
-    elif q:
-        base = q if len(q) < 80 else "не вимикають, крім аварійних"
-    else:
-        base = "—"
-    n = (note or "").strip()
-    if n and n not in base:
-        base = f"{base} ({n})" if len(n) < 60 else base
-    return base
+
+def _is_no_gpv_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t or re.match(r"^[\d.]+$", t):
+        return False
+    return any(
+        m in t
+        for m in (
+            "не вимикається",
+            "не вимикають",
+            "не відключається",
+            "не відключають",
+        )
+    )
 
 
-def format_queue_msg(info: dict) -> str:
+def format_queue_info_short(info: dict) -> str:
+    """Тільки черга/помилка, без блоку «Деталі». Черга — у blockquote."""
+    if info.get("error"):
+        return f"❌ {info['error']}"
     q = info.get("queue") or "—"
     sq = info.get("subqueue") or ""
-    q_low = (q or "").lower()
-    no_gpv = any(
-        m in q_low
-        for m in ("не вимикається", "не вимикають", "не відключається", "не відключають")
-    )
-    if no_gpv:
-        line = "не вимикають, крім аварійних"
+    if _is_no_gpv_text(q) or _is_no_gpv_text(sq):
+        inner = "не вимикають, крім аварійних"
     elif sq and sq != q and len(sq) < 40 and re.match(r"^[\d.]+$", sq.strip()):
-        line = f"Черга: <b>{q}</b>, підчерга: <b>{sq}</b>"
+        inner = f"Черга: <b>{q}</b>, підчерга: <b>{sq}</b>"
+    elif re.match(r"^[\d.]+$", (q or "").strip()):
+        inner = f"Черга: <b>{q}</b>"
+        if sq and re.match(r"^[\d.]+$", sq.strip()):
+            inner += f", підчерга: <b>{sq}</b>"
+    else:
+        # один раз, без дубля queue+subqueue
+        inner = q if len(q) < 80 else "не вимикають, крім аварійних"
+    return f"<blockquote>{inner}</blockquote>"
+
+
+def format_queue_info(info: dict) -> str:
+    if info.get("error"):
+        return f"❌ {info['error']}"
+
+    q = info.get("queue") or "—"
+    sq = info.get("subqueue") or ""
+    if _is_no_gpv_text(q) or _is_no_gpv_text(sq):
+        queue_line = "не вимикають, крім аварійних"
+    elif sq and sq != q and len(sq) < 40 and re.match(r"^[\d.]+$", sq.strip()):
+        queue_line = f"Черга: <b>{q}</b>, підчерга: <b>{sq}</b>"
     elif re.match(r"^[\d.]+$", q.strip()):
-        line = f"Черга: <b>{q}</b>" + (
+        queue_line = f"Черга: <b>{q}</b>" + (
             f", підчерга: <b>{sq}</b>" if sq and re.match(r"^[\d.]+$", sq.strip()) else ""
         )
     else:
-        line = q if len(q) < 80 else "не вимикають, крім аварійних"
-    parts = [line]
-    house = (info.get("house") or "").strip()
-    if house:
-        parts.append(f"🏠 Буд. <b>{house}</b>")
-    elif info.get("houses"):
-        parts.append(f"🏘 Будинки: {info['houses']}")
+        queue_line = q if len(q) < 80 else "не вимикають, крім аварійних"
+
+    details = []
+    if info.get("houses"):
+        details.append(f"🏘 Будинки у довіднику: {info['houses']}")
     if info.get("note"):
-        parts.append(f"📝 {info['note']}")
-    return "\n".join(parts)
+        details.append(f"📝 {info['note']}")
+    matched = []
+    if info.get("matched_city"):
+        matched.append(info["matched_city"])
+    if info.get("matched_street"):
+        matched.append(info["matched_street"])
+    if matched:
+        details.append(f"<i>Знайдено як: {', '.join(matched)}</i>")
+
+    if not details:
+        return queue_line
+
+    # порожній рядок + згортаємий блок «Деталі» (клік у Telegram розкриває)
+    details_block = (
+        "\n\n<blockquote expandable><b>Деталі</b>\n"
+        + "\n".join(details)
+        + "</blockquote>"
+    )
+    return queue_line + details_block
+
+
+def queue_fingerprint_info(info: dict) -> str:
+    if info.get("error") or not (info.get("queue") or info.get("ok")):
+        if info.get("error"):
+            return ""
+    return "|".join([
+        (info.get("queue") or "").strip(),
+        (info.get("subqueue") or "").strip(),
+        (info.get("houses") or "").strip(),
+        (info.get("note") or "").strip(),
+    ])
+
+
+def apply_house_to_result(result: dict, house: str) -> dict:
+    """Підставляє чергу/підчергу/примітку з рядка довідника для конкретного будинку.
+    Ідентично bot/services/address_service.py
+    """
+    out = {**result, "house": house}
+    hmap = result.get("house_map") or {}
+    key = (house or "").strip().lower().replace(" ", "")
+    row = hmap.get(key)
+    if row:
+        out["queue"] = row.get("queue") or out.get("queue") or ""
+        out["subqueue"] = row.get("subqueue") or out.get("subqueue") or ""
+        out["note"] = row.get("note") or out.get("note") or ""
+        out["houses"] = row.get("houses") or house
+    return out
+
+
+def apply_house_to_info(info: dict, house: str | None) -> dict:
+    """Аліас для монітора: без будинку — street-level як у бота."""
+    if not info.get("ok") and not info.get("queue") and info.get("error"):
+        return info
+    house = (house or "").strip()
+    if not house:
+        return info
+    return apply_house_to_result(info, house)
+
+
+# =============================================================================
+# === КІНЕЦЬ queue_client ===
+# =============================================================================
+
+
+def address_key(otg_name: str, city_name: str, street_name: str) -> str:
+    raw = f"{_norm(otg_name)}|{_norm(city_name)}|{_norm(street_name)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def queue_fingerprint(queue: str, subqueue: str, houses: str, note: str) -> str:
+    return "|".join([
+        (queue or "").strip(),
+        (subqueue or "").strip(),
+        (houses or "").strip(),
+        (note or "").strip(),
+    ])
+
+
+def queue_number_fp(queue: str, subqueue: str) -> str:
+    """Тільки номер черги+підчерги — для рішення «чи слати notify»."""
+    return f"{(queue or '').strip()}|{(subqueue or '').strip()}"
+
+
+def _short_queue_label(queue: str, subqueue: str, note: str = "") -> str:
+    q = (queue or "").strip()
+    sq = (subqueue or "").strip()
+    if not q:
+        return "—"
+    t = q.lower()
+    if any(x in t for x in ("не вимика", "не відключ")):
+        return "не вимикають, крім аварійних"
+    if re.match(r"^[\d.]+$", q):
+        if sq and re.match(r"^[\d.]+$", sq):
+            return f"{q}.{sq}" if not q.endswith(f".{sq}") else q
+        return q
+    return q if len(q) < 60 else "не вимикають, крім аварійних"
 
 
 def addr_matches_doc(addr: dict, doc: dict) -> bool:
-    """Чи адреса користувача відповідає запису в queue_directory."""
     if addr.get("queue_key") and doc.get("_id") and addr["queue_key"] == doc["_id"]:
         return True
     return (
         _norm(addr.get("otg_name", "")) == _norm(doc.get("otg_name", ""))
         and _norm(addr.get("city_name", "")) == _norm(doc.get("city_name", ""))
-        and _norm(addr.get("street_name", "")) == _norm(doc.get("street_name", ""))
+        and _norm(addr.get("street_name", "") or addr.get("street", ""))
+        == _norm(doc.get("street_name", ""))
     )
-
-
 
 def send_log(text: str, message_thread_id: int = 155) -> None:
     """Пише підсумок у лог-групу ботом ZTOE (ZTOE_BOT_TOKEN).
@@ -680,7 +822,7 @@ def main() -> int:
         checked += 1
 
         try:
-            street_info = fetch_queue(otg, city, street)
+            street_info = find_queue(otg, city, street)
         except Exception as e:
             log.exception("Помилка запиту для %s: %s", label, e)
             directory.update_one(
