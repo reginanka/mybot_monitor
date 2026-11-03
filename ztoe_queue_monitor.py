@@ -40,7 +40,9 @@ BASE = (
     or os.getenv("QUEUE_SEARCH_URL")
     or "https://www.ztoe.com.ua/unhooking-search.php"
 )
-REQUEST_PAUSE_SEC = float(os.getenv("ZTOE_REQUEST_PAUSE", "0.8"))
+REQUEST_PAUSE_SEC = float(os.getenv("ZTOE_REQUEST_PAUSE", "0.35"))
+HTTP_TIMEOUT = float(os.getenv("ZTOE_HTTP_TIMEOUT", "60"))
+SKIP_RECENT_MINUTES = float(os.getenv("ZTOE_QUEUE_SKIP_MINUTES", "5"))
 
 HEADERS = {
     "User-Agent": (
@@ -50,6 +52,19 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
 }
+
+
+# Кеш на один прогін крону (інакше кожна адреса сканує всі РЕМ → timeout)
+_CITY_OPTIONS_CACHE: dict[str, list[tuple[str, str]]] = {}
+_STREET_OPTIONS_CACHE: dict[tuple[str, str], list[tuple[str, str]]] = {}
+_REMS_CACHE: list[tuple[str, str]] | None = None
+
+
+def clear_queue_http_cache() -> None:
+    global _CITY_OPTIONS_CACHE, _STREET_OPTIONS_CACHE, _REMS_CACHE
+    _CITY_OPTIONS_CACHE = {}
+    _STREET_OPTIONS_CACHE = {}
+    _REMS_CACHE = None
 
 
 # =============================================================================
@@ -333,12 +348,18 @@ def resolve_queue_step(
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
     }
-    with httpx.Client(timeout=25, follow_redirects=True, headers=headers) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
         # --- РЕМ + населений пункт ---
         # У API power-on РЕМ часто «кривий» (Коростень → Хорошівський).
         # Тому: спочатку пробуємо otg_name, якщо не вийшло — шукаємо місто по всіх РЕМ.
-        soup0 = _post(client, {})
-        rems = _options(soup0, "rem_id")
+        global _REMS_CACHE
+        if _REMS_CACHE is not None:
+            rems = _REMS_CACHE
+            soup0 = None
+        else:
+            soup0 = _post(client, {})
+            rems = _options(soup0, "rem_id")
+            _REMS_CACHE = rems
         if not rems:
             return {
                 "error": (
@@ -353,10 +374,16 @@ def resolve_queue_step(
         city_label = city_name
 
         def find_city_in_rem(rid: str):
+            rid = str(rid)
+            if rid in _CITY_OPTIONS_CACHE:
+                cities = _CITY_OPTIONS_CACHE[rid]
+                matches = _filter_matches(cities, city_name, min_score=0.5)
+                return None, matches, cities
             soup = _post(client, {"rem_id": rid})
             cities = _options(soup, "naspunkt_id")
+            _CITY_OPTIONS_CACHE[rid] = cities
             if not cities:
-                return None, [], soup
+                return soup, [], cities
             matches = _filter_matches(cities, city_name, min_score=0.5)
             return soup, matches, cities
 
@@ -489,8 +516,13 @@ def resolve_queue_step(
 
         # --- Вулиця ---
         if not street_id:
-            soup = _post(client, {"rem_id": rem_id, "naspunkt_id": city_id})
-            streets = _options(soup, "vulica_id")
+            sk = (str(rem_id), str(city_id))
+            if sk in _STREET_OPTIONS_CACHE:
+                streets = _STREET_OPTIONS_CACHE[sk]
+            else:
+                soup = _post(client, {"rem_id": rem_id, "naspunkt_id": city_id})
+                streets = _options(soup, "vulica_id")
+                _STREET_OPTIONS_CACHE[sk] = streets
             if not streets:
                 return {
                     "error": (
@@ -779,6 +811,14 @@ def send_log(text: str, message_thread_id: int = 155) -> None:
 
 
 def main() -> int:
+    """
+    Схема:
+      users (notify) → унікальні вулиці (otg|city|street)
+        → якщо directory.last_check_at < SKIP_RECENT_MINUTES — skip мережі
+        → інакше find_queue ОДИН раз на вулицю (кеш прогону)
+        → apply_house_to_result для кожного будинку
+        → оновлення addresses + notify лише при зміні queue/subqueue
+    """
     mongo_uri = os.getenv("MONGO_URI")
     mongo_db = os.getenv("MONGO_DB") or "vidkluchennya"
     bot_token = os.getenv("ZTOE_BOT_TOKEN")
@@ -793,123 +833,355 @@ def main() -> int:
     client = MongoClient(mongo_uri, serverSelectionTimeoutMS=15000)
     db = client[mongo_db]
     directory = db["queue_directory"]
-    users = db["users"]
+    users_col = db["users"]
 
-    docs = list(directory.find({}))
-    log.info("Адреси в queue_directory: %s (db=%s)", len(docs), mongo_db)
+    clear_queue_http_cache()
 
-    if not docs:
-        log.info("Немає адрес для перевірки — вихід")
-        bot = Bot(token=bot_token)
-        send_log("✅ <b>Перевірка черг</b>\n\nУ базі ще немає збережених адрес з чергами.")
+    try:
+        from bot_notify import user_wants as _user_wants, is_quiet_now as _is_quiet
+    except Exception:
+        def _user_wants(u, kind):
+            # як у боті: notify не False → можна
+            if not u:
+                return False
+            if u.get("notify", True) is False:
+                return False
+            return True
+
+        def _is_quiet(_u):
+            return False
+
+    def _addr_list(u: dict) -> list:
+        if isinstance(u.get("addresses"), list) and u["addresses"]:
+            return [a for a in u["addresses"] if isinstance(a, dict)]
+        if isinstance(u.get("address"), dict):
+            return [u["address"]]
+        return []
+
+    def _city_of(a: dict) -> str:
+        return (
+            a.get("city_name")
+            or a.get("city")
+            or (a.get("cityName") if isinstance(a.get("cityName"), str) else "")
+            or ""
+        ).strip()
+
+    def _street_of(a: dict) -> str:
+        return (
+            a.get("street_name")
+            or a.get("street")
+            or a.get("streetName")
+            or ""
+        ).strip()
+
+    def _otg_of(a: dict) -> str:
+        return (
+            a.get("otg_name")
+            or a.get("otg")
+            or a.get("rem_name")
+            or a.get("otgName")
+            or ""
+        ).strip()
+
+    # notify: true АБО поле відсутнє (у боті default True)
+    raw_users = list(
+        users_col.find({"$or": [{"notify": True}, {"notify": {"$exists": False}}]})
+    )
+    # Фільтр hourly лише на етапі РОЗСИЛКИ; перевірку черг робимо для всіх з notify
+    users = list(raw_users)
+
+    streets: dict = {}
+    skip_reasons: Counter = Counter()
+    for u in users:
+        addrs = _addr_list(u)
+        if not addrs:
+            skip_reasons["no_addresses"] += 1
+            continue
+        for idx, a in enumerate(addrs):
+            street = _street_of(a)
+            city = _city_of(a)
+            otg = _otg_of(a)
+            # лише черга без вулиці — з сайту не звірити
+            if a.get("queue_only") and not street:
+                skip_reasons["queue_only"] += 1
+                continue
+            if not street:
+                skip_reasons["no_street"] += 1
+                log.info(
+                    "skip addr tid=%s keys=%s",
+                    u.get("telegram_id"),
+                    sorted(a.keys()),
+                )
+                continue
+            if not city:
+                skip_reasons["no_city"] += 1
+                log.info(
+                    "skip no city tid=%s street=%r keys=%s",
+                    u.get("telegram_id"),
+                    street,
+                    sorted(a.keys()),
+                )
+                continue
+            key = address_key(otg, city, street)
+            bucket = streets.setdefault(
+                key,
+                {"otg": otg, "city": city, "street": street, "pairs": []},
+            )
+            bucket["pairs"].append((u, idx, a))
+
+    log.info(
+        "users=%s streets_unique=%s skip=%s timeout=%ss pause=%ss skip_min=%s",
+        len(users),
+        len(streets),
+        dict(skip_reasons),
+        HTTP_TIMEOUT,
+        REQUEST_PAUSE_SEC,
+        SKIP_RECENT_MINUTES,
+    )
+
+    if not streets:
+        detail = ", ".join(f"{k}={v}" for k, v in skip_reasons.most_common()) or "—"
+        send_log(
+            "✅ <b>Перевірка черг</b>\n\n"
+            "Немає адрес з вулицею для перевірки.\n"
+            f"Юзерів у вибірці: <b>{len(raw_users)}</b>\n"
+            f"Причини пропуску: {detail}"
+        )
         return 0
 
     bot = Bot(token=bot_token)
+    now = datetime.now(timezone.utc)
+    skip_delta = __import__("datetime").timedelta(minutes=SKIP_RECENT_MINUTES)
+
     checked = 0
-    changed = 0
+    skipped_recent = 0
     skipped_temp = 0
+    changed = 0
     notified_users = 0
     errors = 0
     error_msg_counts: Counter = Counter()
-    error_doc_ids: list = []
     temp_msg_counts: Counter = Counter()
 
-    for doc in docs:
-        otg = doc.get("otg_name") or ""
-        city = doc.get("city_name") or ""
-        street = doc.get("street_name") or ""
+    # run-level cache: key -> street_info dict
+    run_cache: dict = {}
+
+    for key, meta in streets.items():
+        otg, city, street = meta["otg"], meta["city"], meta["street"]
         label = f"{otg} / {city} / {street}"
-        checked += 1
+        pairs = meta["pairs"]
 
-        try:
-            street_info = find_queue(otg, city, street)
-        except Exception as e:
-            log.exception("Помилка запиту для %s: %s", label, e)
+        # directory doc (для last_check_at + snapshot)
+        doc = directory.find_one({"_id": key})
+        if not doc:
+            # legacy: шукати по назвах
+            doc = directory.find_one(
+                {
+                    "otg_name": otg,
+                    "city_name": city,
+                    "street_name": street,
+                }
+            )
+
+        # skip якщо цю вулицю вже перевіряли недавно (повторний dispatch)
+        last_check = None
+        if doc and doc.get("last_check_at"):
+            last_check = doc["last_check_at"]
+            if getattr(last_check, "tzinfo", None) is None:
+                last_check = last_check.replace(tzinfo=timezone.utc)
+        if last_check and (now - last_check) < skip_delta and key not in run_cache:
+            # можна взяти snapshot з directory якщо є queue
+            if doc and (doc.get("queue") is not None or doc.get("all_houses")):
+                log.info("skip recent (%s min): %s", SKIP_RECENT_MINUTES, label)
+                skipped_recent += 1
+                # synthetic street_info з directory для per-house update без мережі
+                street_info = {
+                    "ok": True,
+                    "queue": doc.get("queue") or "",
+                    "subqueue": doc.get("subqueue") or "",
+                    "houses": doc.get("houses") or "",
+                    "note": doc.get("note") or "",
+                    "all_houses": doc.get("all_houses") or [],
+                    "house_map": doc.get("house_map") or {},
+                    "rows": doc.get("rows") or [],
+                    "matched_rem": doc.get("matched_rem"),
+                    "matched_city": doc.get("matched_city"),
+                    "matched_street": doc.get("matched_street"),
+                    "_from_cache": True,
+                }
+                # якщо house_map порожній — без мережі точність по будинку низька; skip updates
+                if not street_info.get("house_map") and not street_info.get("rows"):
+                    continue
+                run_cache[key] = street_info
+            else:
+                log.info("skip recent but no snapshot, will fetch: %s", label)
+
+        if key not in run_cache:
+            try:
+                street_info = find_queue(otg, city, street)
+            except httpx.TimeoutException as e:
+                log.warning("Timeout для %s: %s", label, e)
+                directory.update_one(
+                    {"_id": key},
+                    {
+                        "$set": {
+                            "otg_name": otg,
+                            "city_name": city,
+                            "street_name": street,
+                            "last_error": "timed out",
+                            "last_check_at": now,
+                        }
+                    },
+                    upsert=True,
+                )
+                skipped_temp += 1
+                temp_msg_counts["timed out"] += 1
+                continue
+            except Exception as e:
+                log.exception("Помилка запиту для %s: %s", label, e)
+                directory.update_one(
+                    {"_id": key},
+                    {
+                        "$set": {
+                            "otg_name": otg,
+                            "city_name": city,
+                            "street_name": street,
+                            "last_error": str(e),
+                            "last_check_at": now,
+                        }
+                    },
+                    upsert=True,
+                )
+                errors += 1
+                error_msg_counts[str(e)] += 1
+                continue
+
+            if street_info.get("temporary"):
+                msg = street_info.get("message") or street_info.get("error") or "temporary"
+                log.warning("Тимчасово недоступно: %s — %s", label, msg)
+                directory.update_one(
+                    {"_id": key},
+                    {
+                        "$set": {
+                            "otg_name": otg,
+                            "city_name": city,
+                            "street_name": street,
+                            "last_error": msg,
+                            "last_check_at": now,
+                        }
+                    },
+                    upsert=True,
+                )
+                skipped_temp += 1
+                temp_msg_counts[str(msg)] += 1
+                continue
+
+            if street_info.get("error") and not street_info.get("ok"):
+                msg = street_info.get("message") or street_info.get("error") or "unknown"
+                log.warning("Не знайдено: %s — %s", label, msg)
+                directory.update_one(
+                    {"_id": key},
+                    {
+                        "$set": {
+                            "otg_name": otg,
+                            "city_name": city,
+                            "street_name": street,
+                            "last_error": msg,
+                            "last_check_at": now,
+                        }
+                    },
+                    upsert=True,
+                )
+                errors += 1
+                error_msg_counts[str(msg)] += 1
+                continue
+
+            # snapshot у directory (включно house_map для skip recent)
+            # house_map values may have non-serializable stuff — store slim rows
+            slim_map = {}
+            for hk, row in (street_info.get("house_map") or {}).items():
+                if isinstance(row, dict):
+                    slim_map[hk] = {
+                        "queue": row.get("queue") or "",
+                        "subqueue": row.get("subqueue") or "",
+                        "houses": row.get("houses") or "",
+                        "note": row.get("note") or "",
+                    }
             directory.update_one(
-                {"_id": doc["_id"]},
-                {"$set": {
-                    "last_error": str(e),
-                    "last_check_at": datetime.now(timezone.utc),
-                }},
+                {"_id": key},
+                {
+                    "$set": {
+                        "otg_name": otg,
+                        "city_name": city,
+                        "street_name": street,
+                        "queue": street_info.get("queue") or "",
+                        "subqueue": street_info.get("subqueue") or "",
+                        "houses": street_info.get("houses") or "",
+                        "note": street_info.get("note") or "",
+                        "all_houses": street_info.get("all_houses") or [],
+                        "house_map": slim_map,
+                        "matched_rem": street_info.get("matched_rem"),
+                        "matched_city": street_info.get("matched_city"),
+                        "matched_street": street_info.get("matched_street"),
+                        "rem_id": street_info.get("rem_id"),
+                        "city_id": street_info.get("city_id"),
+                        "street_id": street_info.get("street_id"),
+                        "updated_at": now,
+                        "last_check_at": now,
+                        "last_error": None,
+                    }
+                },
+                upsert=True,
             )
-            errors += 1
-            error_msg_counts[str(e)] += 1
-            error_doc_ids.append(doc.get("_id"))
-            continue
-
-        if street_info.get("temporary"):
-            msg = street_info.get("message") or "temporary"
-            log.warning("Тимчасово недоступно: %s — %s", label, msg)
-            directory.update_one(
-                {"_id": doc["_id"]},
-                {"$set": {
-                    "last_error": msg,
-                    "last_check_at": datetime.now(timezone.utc),
-                }},
+            # підставити slim house_map назад
+            street_info = {**street_info, "house_map": slim_map or street_info.get("house_map") or {}}
+            run_cache[key] = street_info
+            checked += 1
+            log.info(
+                "fetched %s q=%s.%s houses=%s pairs=%s",
+                label,
+                street_info.get("queue"),
+                street_info.get("subqueue"),
+                len(street_info.get("all_houses") or []),
+                len(pairs),
             )
-            skipped_temp += 1
-            temp_msg_counts[msg] += 1
-            continue
+        else:
+            street_info = run_cache[key]
 
-        if street_info.get("error"):
-            msg = street_info.get("message") or street_info.get("error") or "unknown"
-            log.warning("Не знайдено: %s — %s", label, msg)
-            directory.update_one(
-                {"_id": doc["_id"]},
-                {"$set": {
-                    "last_error": msg,
-                    "last_check_at": datetime.now(timezone.utc),
-                }},
+        # --- оновлення кожного user/addr на цій вулиці ---
+        # group pairs by telegram_id to one write per user
+        by_tid = {}
+        for u, idx, a in pairs:
+            tid = u.get("telegram_id")
+            if tid is None:
+                continue
+            by_tid.setdefault(int(tid), {"user": u, "items": []})["items"].append((idx, a))
+
+        for tid, pack in by_tid.items():
+            user = pack["user"]
+            addrs = list(
+                user.get("addresses")
+                or ([user["address"]] if user.get("address") else [])
             )
-            errors += 1
-            error_msg_counts[msg] += 1
-            error_doc_ids.append(doc.get("_id"))
-            continue
-
-        # street-level snapshot у directory (для діагностики; сповіщення — per-house)
-        street_fp = queue_fingerprint(
-            street_info.get("queue", ""),
-            street_info.get("subqueue", ""),
-            street_info.get("houses", ""),
-            street_info.get("note", ""),
-        )
-        directory.update_one(
-            {"_id": doc["_id"]},
-            {"$set": {
-                "queue": street_info.get("queue", ""),
-                "subqueue": street_info.get("subqueue", ""),
-                "houses": street_info.get("houses", ""),
-                "note": street_info.get("note", ""),
-                "queue_fp": street_fp,
-                "matched_rem": street_info.get("matched_rem"),
-                "matched_city": street_info.get("matched_city"),
-                "matched_street": street_info.get("matched_street"),
-                "all_houses": street_info.get("all_houses") or [],
-                "updated_at": datetime.now(timezone.utc),
-                "last_check_at": datetime.now(timezone.utc),
-                "last_error": None,
-            }},
-        )
-
-        # Користувачі з цією вулицею — черга рахується по їхньому номеру будинку
-        cursor = users.find({"notify": True})
-        try:
-            from bot_notify import user_wants as _user_wants
-        except Exception:
-            def _user_wants(u, kind):
-                return True
-        for user in cursor:
-            addrs = user.get("addresses") or (
-                [user["address"]] if user.get("address") else []
-            )
+            # ensure list of dicts length
+            if not isinstance(addrs, list):
+                continue
             new_addrs = []
-            touched = False
+            # map index -> we only replace matching street addrs
+            items_by_idx = {idx: a for idx, a in pack["items"]}
             notify_info = None
             notify_label_house = ""
             notify_old = {}
+            touched = False
 
-            for a in addrs:
-                if not addr_matches_doc(a, doc):
+            for i, a in enumerate(addrs):
+                if not isinstance(a, dict):
+                    new_addrs.append(a)
+                    continue
+                if i not in items_by_idx and not (
+                    _norm(a.get("otg_name", "")) == _norm(otg)
+                    and _norm(a.get("city_name", "")) == _norm(city)
+                    and _norm(a.get("street_name", "") or a.get("street", "")) == _norm(street)
+                ):
                     new_addrs.append(a)
                     continue
 
@@ -918,168 +1190,117 @@ def main() -> int:
                 new_fp = queue_fingerprint(
                     info.get("queue", ""),
                     info.get("subqueue", ""),
-                    # у fp кладемо саме house (не весь список), щоб не плутати з чужими номерами
                     house or (info.get("houses") or ""),
                     info.get("note", ""),
                 )
                 old_fp = a.get("queue_fp") or ""
-
-                updated = {
-                    **a,
-                    "queue": info.get("queue", ""),
-                    "subqueue": info.get("subqueue", ""),
-                    "queue_houses": info.get("houses", ""),
-                    "queue_note": info.get("note", ""),
-                    "queue_fp": new_fp,
-                    "queue_updated_at": datetime.now(timezone.utc).isoformat(),
-                    "queue_key": doc["_id"],
-                }
-                if house:
-                    updated["house"] = house
-
-                new_addrs.append(updated)
-                touched = True
-
-                # Сповіщати лише якщо змінився НОМЕР черги/підчерги (як очікує юзер),
-                # не через note / перестановку houses у fp.
                 old_q = (a.get("queue") or "").strip()
                 old_sq = (a.get("subqueue") or "").strip()
                 new_q = (info.get("queue") or "").strip()
                 new_sq = (info.get("subqueue") or "").strip()
-                queue_changed = bool(old_fp) and (old_q != new_q or old_sq != new_sq)
-                if queue_changed:
+
+                updated = {
+                    **a,
+                    "queue": new_q,
+                    "subqueue": new_sq,
+                    "queue_houses": info.get("houses", ""),
+                    "queue_note": info.get("note", ""),
+                    "queue_fp": new_fp,
+                    "queue_updated_at": now.isoformat(),
+                    "queue_key": key,
+                }
+                if house:
+                    updated["house"] = house
+                new_addrs.append(updated)
+                touched = True
+
+                if old_fp and queue_number_fp(old_q, old_sq) != queue_number_fp(new_q, new_sq):
                     changed += 1
                     notify_info = info
                     notify_label_house = house
-                    notify_old = {
-                        "queue": old_q,
-                        "subqueue": old_sq,
-                        "note": a.get("queue_note") or "",
-                    }
+                    notify_old = {"queue": old_q, "subqueue": old_sq, "note": a.get("queue_note") or ""}
                     log.info(
-                        "Зміна черги: %s house=%s %s.%s → %s.%s matched=%s",
+                        "Зміна черги: %s house=%s %s|%s → %s|%s",
                         label, house or "—", old_q, old_sq, new_q, new_sq,
-                        info.get("house_matched"),
                     )
                 elif not old_fp and new_fp:
-                    log.info("Перша фіксація черги (без notify): %s house=%s q=%s.%s",
-                             label, house or "—", new_q, new_sq)
-                elif old_fp and new_fp and old_fp != new_fp and not queue_changed:
                     log.info(
-                        "fp змінився без зміни черги (skip notify): %s house=%s",
-                        label, house or "—",
+                        "Перша фіксація черги (без notify): %s house=%s q=%s|%s",
+                        label, house or "—", new_q, new_sq,
                     )
 
             if not touched:
                 continue
 
-            users.update_one(
-                {"telegram_id": user["telegram_id"]},
+            users_col.update_one(
+                {"telegram_id": tid},
                 {"$set": {"addresses": new_addrs}, "$unset": {"address": ""}},
             )
 
             if notify_info is None:
                 continue
+            if not _user_wants(user, "hourly"):
+                continue
 
-            city_s = city
-            street_s = street
             house_bit = f", буд. {notify_label_house}" if notify_label_house else ""
             was = _short_queue_label(
                 notify_old.get("queue", ""),
                 notify_old.get("subqueue", ""),
                 notify_old.get("note", ""),
             )
-            now = _short_queue_label(
+            now_lbl = _short_queue_label(
                 notify_info.get("queue", ""),
                 notify_info.get("subqueue", ""),
                 notify_info.get("note", ""),
             )
             text_msg = (
                 "🔔 <b>Змінилася черга відключень:</b>\n\n"
-                f"<b>{city_s}, {street_s}{house_bit}</b>\n\n"
+                f"<b>{city}, {street}{house_bit}</b>\n\n"
                 f"Було: <b>{was}</b>\n"
-                f"Стало: <b>{now}</b>"
+                f"Стало: <b>{now_lbl}</b>"
             )
+            silent = _is_quiet(user)
             try:
-                from bot_notify import is_quiet_now as _is_quiet
-            except Exception:
-                def _is_quiet(_u):
-                    return False
-            if not _user_wants(user, "hourly"):
-                continue
-            try:
-                silent = _is_quiet(user)
-                async def _send(tid=user["telegram_id"], body=text_msg, silent=silent):
+                async def _send(chat_id=tid, body=text_msg, silent=silent):
                     await bot.send_message(
-                        chat_id=tid,
-                        text=body,
+                        chat_id=chat_id,
+                        text=body[:4096],
                         parse_mode="HTML",
+                        disable_web_page_preview=True,
                         disable_notification=silent,
                     )
 
                 asyncio.run(_send())
                 notified_users += 1
-                log.info("Сповіщено %s silent=%s", user["telegram_id"], silent)
-                time.sleep(0.3)
+                log.info("Надіслано %s silent=%s", tid, silent)
+                time.sleep(0.35)
             except Exception as e:
-                log.error("Не вдалося надіслати %s: %s", user.get("telegram_id"), e)
-
-    # Скільки користувачів мають адреси з помилкових записів directory
-    users_with_errors = 0
-    if error_doc_ids:
-        err_id_set = {i for i in error_doc_ids if i is not None}
-        # також індекс помилкових ключів (otg/city/street) на випадок без _id match
-        err_docs = list(directory.find({"_id": {"$in": list(err_id_set)}})) if err_id_set else []
-        for user in users.find({}):
-            addrs = user.get("addresses") or (
-                [user["address"]] if user.get("address") else []
-            )
-            hit = False
-            for a in addrs:
-                if not isinstance(a, dict):
-                    continue
-                for ed in err_docs:
-                    if addr_matches_doc(a, ed):
-                        hit = True
-                        break
-                if hit:
-                    break
-            if hit:
-                users_with_errors += 1
-
-    detail_lines: list[str] = []
-    if errors or skipped_temp:
-        detail_lines.append("<b>Деталі помилок</b>")
-        if errors:
-            detail_lines.append(f"Користувач з помилками: {users_with_errors}")
-            # агреговані причини (повідомлення → кількість адрес)
-            for msg, cnt in error_msg_counts.most_common():
-                detail_lines.append(f"{msg}: {cnt}")
-        if skipped_temp:
-            detail_lines.append(f"Тимчасово недоступно (адрес): {skipped_temp}")
-            for msg, cnt in temp_msg_counts.most_common():
-                detail_lines.append(f"{msg}: {cnt}")
+                log.error("Не вдалося надіслати %s: %s", tid, e)
 
     summary = (
         f"✅ <b>Перевірка черг</b>\n\n"
-        f"Перевірено адрес: <b>{checked}</b>\n"
+        f"Підписників: <b>{len(users)}</b>\n"
+        f"Унікальних вулиць: <b>{len(streets)}</b>\n"
+        f"Запитів на сайт: <b>{checked}</b>\n"
+        f"Пропущено (недавно): <b>{skipped_recent}</b>\n"
         f"Черга змінилась: <b>{changed}</b>\n"
         f"Сповіщено людей: <b>{notified_users}</b>\n"
         f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>\n"
-        f"Помилок всього: <b>{errors}</b>"
-    )
-    if detail_lines:
-        summary += "\n\n" + "\n".join(detail_lines)
-
-    log.info(
-        "Готово: checked=%s changed=%s notified=%s temp=%s errors=%s users_err=%s",
-        checked, changed, notified_users, skipped_temp, errors, users_with_errors,
+        f"Помилок: <b>{errors}</b>"
     )
     if error_msg_counts:
-        log.warning(
-            "Помилки (агреговано): %s",
-            "; ".join(f"{m}: {c}" for m, c in error_msg_counts.most_common()),
+        summary += "\n\n<b>Помилки</b>\n" + "\n".join(
+            f"{m}: {c}" for m, c in error_msg_counts.most_common()
         )
+    if temp_msg_counts:
+        summary += "\n\n<b>Тимчасово</b>\n" + "\n".join(
+            f"{m}: {c}" for m, c in temp_msg_counts.most_common()
+        )
+
+    log.info(
+        "Готово users=%s streets=%s fetched=%s skip_recent=%s changed=%s notified=%s temp=%s err=%s",
+        len(users), len(streets), checked, skipped_recent, changed, notified_users, skipped_temp, errors,
+    )
     send_log(summary)
     return 0
 
