@@ -819,26 +819,64 @@ def main() -> int:
                 log.error("Fetch otg=%s: %s", otg_id, e)
                 otg_outages_cache[otg_id] = []
 
-        for (otg_id, city_id), group_pairs in groups.items():
-            raw = otg_outages_cache.get(otg_id) or []
-            outages = filter_by_city(raw, city_id)
+        # Обробка по РЕМ (otg), НЕ по city_id:
+        # city_id у профілі часто ≠ city.id в аварії ЖОЕ → fetched=0 і «не бачить» продовження.
+        otg_to_pairs: Dict[int, List[Tuple[dict, dict]]] = {}
+        for (otg_id, _city_id), pairs in groups.items():
+            otg_to_pairs.setdefault(otg_id, []).extend(pairs)
 
+        for otg_id, group_pairs in sorted(otg_to_pairs.items()):
+            raw = otg_outages_cache.get(otg_id) or []
+            outages = list(raw)  # увесь РЕМ
             groups_checked += 1
+
             current_ids = {make_outage_key(o) for o in outages}
             current_fps = {content_fingerprint(o) for o in outages}
             current_soft = {soft_fingerprint(o) for o in outages}
 
-            cache_key = f"{otg_id}_{city_id or 0}"
+            # Кеш на рівні РЕМ (старі ключі otg_city підхоплюємо для міграції)
+            cache_key = f"{otg_id}"
             cache = outages_col.find_one({"_id": cache_key}) or {}
+            if not cache.get("fps"):
+                # злити fps/plans зі старих per-city кешів цього otg
+                merged_fps: set = set()
+                merged_soft: set = set()
+                merged_plans: dict = {}
+                merged_plans_id: dict = {}
+                try:
+                    for doc in outages_col.find({"_id": {"$regex": f"^{otg_id}_"}}):
+                        merged_fps |= set(doc.get("fps") or [])
+                        merged_soft |= set(doc.get("soft_fps") or [])
+                        for k, v in (doc.get("plan_by_soft") or {}).items():
+                            merged_plans[str(k)] = str(v)[:16]
+                        for k, v in (doc.get("plan_by_id") or {}).items():
+                            merged_plans_id[str(k)] = str(v)[:16]
+                except Exception:
+                    pass
+                if merged_fps or merged_plans or merged_plans_id:
+                    cache = {
+                        "fps": list(merged_fps),
+                        "soft_fps": list(merged_soft),
+                        "plan_by_soft": merged_plans,
+                        "plan_by_id": merged_plans_id,
+                    }
+
             prev_fps = set(cache.get("fps") or [])
             prev_soft = set(cache.get("soft_fps") or [])
+            prev_plans = {
+                str(k): str(v)[:16]
+                for k, v in (cache.get("plan_by_soft") or {}).items()
+            }
+            prev_plans_id = {
+                str(k): str(v)[:16]
+                for k, v in (cache.get("plan_by_id") or {}).items()
+            }
 
             new_fps = current_fps - prev_fps
             new_outages = [o for o in outages if content_fingerprint(o) in new_fps]
 
             filtered = []
             for o in new_outages:
-                # ГПВ (switchSubReason=2) — це графік, не «нова аварія»
                 if not should_notify_outage(o):
                     log.info(
                         "skip GPV/non-notify id=%s sub=%s type=%s",
@@ -854,94 +892,115 @@ def main() -> int:
                 filtered.append(o)
             new_outages = filtered
 
-            # Зміна очікуваного часу увімкнення (datePlanIn) для вже відомої події
-            prev_plans = {
-                str(k): str(v)[:16]
-                for k, v in (cache.get("plan_by_soft") or {}).items()
-            }
+            # Зміна datePlanIn: по soft_fp АБО по id запису в API
             plan_updates: List[dict] = []
             new_fp_set = {content_fingerprint(o) for o in new_outages}
             for o in outages:
                 if not should_notify_outage(o):
                     continue
                 fp = content_fingerprint(o)
-                if fp in new_fp_set or fp not in prev_fps:
-                    # нова подія вже в new_outages, або взагалі невідома (теж піде як new)
+                if fp in new_fp_set:
                     continue
                 soft = soft_fingerprint(o)
+                oid = make_outage_key(o)
                 new_plan = (o.get("datePlanIn") or "")[:16]
-                old_plan = (prev_plans.get(soft) or "")[:16]
-                if old_plan and new_plan and old_plan != new_plan:
+                old_plan = (
+                    prev_plans_id.get(oid)
+                    or prev_plans.get(soft)
+                    or ""
+                )[:16]
+                # відома подія (id або soft уже бачили) + змінився план
+                known = oid in prev_plans_id or soft in prev_plans or soft in prev_soft or fp in prev_fps
+                if known and old_plan and new_plan and old_plan != new_plan:
                     oo = dict(o)
                     oo["_plan_updated"] = True
                     oo["_plan_was"] = old_plan
                     plan_updates.append(oo)
+                elif known and not old_plan and new_plan:
+                    # перший раз бачимо план, але fingerprint вже був —
+                    # порівняти з тим, що в Mongo outages (якщо є старий datePlanIn)
+                    pass
+
+            # Додатково: якщо в full-колекції outages інший datePlanIn ніж в API — теж update
+            extra_plan: List[dict] = []
+            if not plan_updates:
+                try:
+                    for o in outages:
+                        if not should_notify_outage(o):
+                            continue
+                        if content_fingerprint(o) in new_fp_set:
+                            continue
+                        sid = o.get("id")
+                        src = o.get("_source") or "accidents"
+                        if sid is None:
+                            continue
+                        doc = outages_full.find_one(
+                            {"source_id": sid, "source": src}
+                        ) or outages_full.find_one({"source_id": sid})
+                        if not doc:
+                            continue
+                        old_plan = (doc.get("datePlanIn") or "")[:16]
+                        new_plan = (o.get("datePlanIn") or "")[:16]
+                        if old_plan and new_plan and old_plan != new_plan:
+                            oo = dict(o)
+                            oo["_plan_updated"] = True
+                            oo["_plan_was"] = old_plan
+                            extra_plan.append(oo)
+                except Exception as e:
+                    log.warning("plan compare via outages col: %s", e)
+            if extra_plan:
+                seen_soft = {soft_fingerprint(o) for o in plan_updates}
+                for o in extra_plan:
+                    if soft_fingerprint(o) not in seen_soft:
+                        plan_updates.append(o)
+
             if plan_updates:
-                log.info(
-                    "otg=%s city=%s plan_updates=%s",
-                    otg_id,
-                    city_id,
-                    len(plan_updates),
-                )
+                log.info("otg=%s plan_updates=%s", otg_id, len(plan_updates))
                 new_outages = list(new_outages) + plan_updates
 
             log.info(
-                "otg=%s city=%s fetched=%s cache_fps=%s new=%s plan_upd=%s",
+                "otg=%s fetched=%s cache_fps=%s new=%s plan_upd=%s addrs=%s",
                 otg_id,
-                city_id,
                 len(outages),
                 len(prev_fps),
-                len(new_outages) - len(plan_updates),
+                max(0, len(new_outages) - len(plan_updates)),
                 len(plan_updates),
+                len(group_pairs),
             )
 
-            # Bulk upsert full docs (для /check)
+            # Upsert УСІ аварії РЕМ у outages (для /check) — завжди свіжі дати
             if outages:
                 ops = []
                 for o in outages:
                     doc = outage_to_mongo_doc(o)
                     ops.append(
                         UpdateOne(
-                            {"source": doc["source"], "source_id": doc["source_id"]},
+                            {
+                                "source_id": doc["source_id"],
+                                "source": doc["source"],
+                            },
                             {"$set": doc},
                             upsert=True,
                         )
                     )
                 if ops:
-                    # chunk на випадок дуже великих списків
-                    for i in range(0, len(ops), 500):
-                        outages_full.bulk_write(ops[i : i + 500], ordered=False)
+                    try:
+                        outages_full.bulk_write(ops, ordered=False)
+                    except Exception as e:
+                        log.warning("bulk outages otg=%s: %s", otg_id, e)
 
             matched_fps: set = set()
-
             if new_outages:
                 for user, addr in group_pairs:
                     tid = user.get("telegram_id")
-                    if not tid:
+                    if tid is None:
                         continue
                     street_id = addr.get("street_id") or addr.get("streetId")
-                    street_name = (addr.get("street_name") or addr.get("street") or "").strip().lower()
+                    street_name = (
+                        addr.get("street_name") or addr.get("street") or ""
+                    )
                     house = addr.get("house") or addr.get("building") or ""
                     uqk = user_queue_key(addr)
-
-                    # queue_key на full docs тільки для зматчених адрес
-                    if uqk:
-                        queue_ops = []
-                        for outage in outages:
-                            if not matches_street(outage, street_id, street_name):
-                                continue
-                            if not matches_building(outage, str(house)):
-                                continue
-                            doc = outage_to_mongo_doc(outage, queue_key=uqk)
-                            queue_ops.append(
-                                UpdateOne(
-                                    {"source": doc["source"], "source_id": doc["source_id"]},
-                                    {"$set": doc},
-                                    upsert=True,
-                                )
-                            )
-                        if queue_ops:
-                            outages_full.bulk_write(queue_ops, ordered=False)
 
                     for outage in new_outages:
                         if not matches_street(outage, street_id, street_name):
@@ -949,71 +1008,88 @@ def main() -> int:
                         if not matches_building(outage, str(house)):
                             continue
                         if uqk:
+                            outage = dict(outage)
                             outage["_user_queue"] = uqk
-                        notified.setdefault(tid, [])
+                        notified.setdefault(int(tid), [])
                         fp = content_fingerprint(outage)
+                        # для plan-update — окремий ключ, щоб не злиплось з «новою»
+                        dedup = fp + (
+                            "|plan:" + (outage.get("datePlanIn") or "")[:16]
+                            if outage.get("_plan_updated")
+                            else ""
+                        )
                         if any(
-                            content_fingerprint(x[0] if isinstance(x, tuple) else x) == fp
-                            for x in notified[tid]
+                            (
+                                content_fingerprint(x[0] if isinstance(x, tuple) else x)
+                                + (
+                                    "|plan:"
+                                    + ((x[0] if isinstance(x, tuple) else x).get("datePlanIn") or "")[
+                                        :16
+                                    ]
+                                    if (x[0] if isinstance(x, tuple) else x).get("_plan_updated")
+                                    else ""
+                                )
+                            )
+                            == dedup
+                            for x in notified[int(tid)]
                         ):
                             continue
-                        notified[tid].append((outage, addr))
+                        notified[int(tid)].append((outage, addr))
                         matched_fps.add(fp)
 
                 log.info(
-                    "otg=%s city=%s matched_new=%s (addrs=%s)",
+                    "otg=%s matched_new=%s (addrs=%s candidates=%s)",
                     otg_id,
-                    city_id,
                     len(matched_fps),
                     len(group_pairs),
+                    len(new_outages),
                 )
                 if new_outages and not matched_fps:
                     sample = []
-                    for o in new_outages[:5]:
+                    for o in new_outages[:8]:
                         st = (o.get("street") or {}).get("name") or "?"
-                        bld = (o.get("buildingNames") or "")[:30]
-                        sample.append(f"{st}|{bld}|type={o.get('typeOff')}")
-                    log.info("no street match; API sample: %s", " || ".join(sample))
+                        bld = (o.get("buildingNames") or "")[:40]
+                        sample.append(
+                            f"{st}|{bld}|type={o.get('typeOff')}|plan={str(o.get('datePlanIn') or '')[:16]}|upd={bool(o.get('_plan_updated'))}"
+                        )
+                    log.info("no street/house match; API sample: %s", " || ".join(sample))
                     for user, addr in group_pairs:
                         log.info(
-                            "  user street=%r id=%s house=%r",
+                            "  user street=%r id=%s house=%r city_id=%s",
                             addr.get("street_name") or addr.get("street"),
                             addr.get("street_id") or addr.get("streetId"),
                             addr.get("house"),
+                            addr.get("city_id") or addr.get("cityId"),
                         )
 
-            # Кеш fps (soft_fps з капом, щоб документ не товстішав роками)
-            if prev_fps or matched_fps or not new_outages:
-                soft_stored = merge_soft_fps(current_soft, prev_soft, SOFT_FPS_MAX)
-                # Актуальні datePlanIn по soft_fp (для детекту «продовжили до …»)
-                plan_by_soft = {}
-                for o in outages:
-                    soft = soft_fingerprint(o)
-                    plan = (o.get("datePlanIn") or "")[:16]
-                    if soft and plan:
-                        plan_by_soft[soft] = plan
-                # лишаємо плани лише для soft, які ще є в API (не роздуваємо)
-                outages_col.update_one(
-                    {"_id": cache_key},
-                    {
-                        "$set": {
-                            "ids": list(current_ids),
-                            "fps": list(current_fps),
-                            "soft_fps": soft_stored,
-                            "plan_by_soft": plan_by_soft,
-                            "updated_at": datetime.now(timezone.utc),
-                            "count": len(current_ids),
-                        }
-                    },
-                    upsert=True,
-                )
-            else:
-                log.warning(
-                    "otg=%s city=%s: new=%s but 0 matched — cache NOT updated (можна виправити адреси і повторити)",
-                    otg_id,
-                    city_id,
-                    len(new_outages),
-                )
+            # Кеш РЕМ завжди оновлюємо (і плани теж) — інакше «не бачить» далі
+            soft_stored = merge_soft_fps(current_soft, prev_soft, SOFT_FPS_MAX)
+            plan_by_soft = {}
+            plan_by_id = {}
+            for o in outages:
+                soft = soft_fingerprint(o)
+                plan = (o.get("datePlanIn") or "")[:16]
+                oid = make_outage_key(o)
+                if soft and plan:
+                    plan_by_soft[soft] = plan
+                if oid and plan:
+                    plan_by_id[oid] = plan
+            outages_col.update_one(
+                {"_id": cache_key},
+                {
+                    "$set": {
+                        "ids": list(current_ids),
+                        "fps": list(current_fps),
+                        "soft_fps": soft_stored,
+                        "plan_by_soft": plan_by_soft,
+                        "plan_by_id": plan_by_id,
+                        "updated_at": datetime.now(timezone.utc),
+                        "count": len(current_ids),
+                    }
+                },
+                upsert=True,
+            )
+
     finally:
         http.close()
 
