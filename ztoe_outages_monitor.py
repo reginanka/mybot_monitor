@@ -245,15 +245,25 @@ def format_outage(outage: dict) -> str:
     date_event = (outage.get("dateEvent") or "")[:16].replace("T", " ")
     date_plan = (outage.get("datePlanIn") or "")[:16].replace("T", " ")
     icon, type_name, type_desc = outage_notify_label(outage)
-    text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
-    if type_desc:
-        text += f" — {type_desc}"
+    if outage.get("_plan_updated"):
+        text = f"⏱ <b>Оновлення:</b> {city}, {street}\n📌 {type_name}"
+        if type_desc:
+            text += f" — {type_desc}"
+        was = (outage.get("_plan_was") or "")[:16].replace("T", " ")
+        if was and date_plan and was != date_plan:
+            text += f"\n⏳ План увімкнення: <s>{was}</s> → <b>{date_plan}</b>"
+        elif date_plan:
+            text += f"\n⏳ До (план): {date_plan}"
+    else:
+        text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
+        if type_desc:
+            text += f" — {type_desc}"
+        if date_plan:
+            text += f"\n⏳ До (план): {date_plan}"
     if buildings:
         text += f"\n🏘 Будинки: {buildings}"
     if date_event:
         text += f"\n⏰ З: {date_event}"
-    if date_plan:
-        text += f"\n⏳ До (план): {date_plan}"
     koment = (outage.get("koment") or "").strip()
     if koment:
         text += f"\n💬 {koment}"
@@ -844,13 +854,45 @@ def main() -> int:
                 filtered.append(o)
             new_outages = filtered
 
+            # Зміна очікуваного часу увімкнення (datePlanIn) для вже відомої події
+            prev_plans = {
+                str(k): str(v)[:16]
+                for k, v in (cache.get("plan_by_soft") or {}).items()
+            }
+            plan_updates: List[dict] = []
+            new_fp_set = {content_fingerprint(o) for o in new_outages}
+            for o in outages:
+                if not should_notify_outage(o):
+                    continue
+                fp = content_fingerprint(o)
+                if fp in new_fp_set or fp not in prev_fps:
+                    # нова подія вже в new_outages, або взагалі невідома (теж піде як new)
+                    continue
+                soft = soft_fingerprint(o)
+                new_plan = (o.get("datePlanIn") or "")[:16]
+                old_plan = (prev_plans.get(soft) or "")[:16]
+                if old_plan and new_plan and old_plan != new_plan:
+                    oo = dict(o)
+                    oo["_plan_updated"] = True
+                    oo["_plan_was"] = old_plan
+                    plan_updates.append(oo)
+            if plan_updates:
+                log.info(
+                    "otg=%s city=%s plan_updates=%s",
+                    otg_id,
+                    city_id,
+                    len(plan_updates),
+                )
+                new_outages = list(new_outages) + plan_updates
+
             log.info(
-                "otg=%s city=%s fetched=%s cache_fps=%s new=%s",
+                "otg=%s city=%s fetched=%s cache_fps=%s new=%s plan_upd=%s",
                 otg_id,
                 city_id,
                 len(outages),
                 len(prev_fps),
-                len(new_outages),
+                len(new_outages) - len(plan_updates),
+                len(plan_updates),
             )
 
             # Bulk upsert full docs (для /check)
@@ -943,6 +985,14 @@ def main() -> int:
             # Кеш fps (soft_fps з капом, щоб документ не товстішав роками)
             if prev_fps or matched_fps or not new_outages:
                 soft_stored = merge_soft_fps(current_soft, prev_soft, SOFT_FPS_MAX)
+                # Актуальні datePlanIn по soft_fp (для детекту «продовжили до …»)
+                plan_by_soft = {}
+                for o in outages:
+                    soft = soft_fingerprint(o)
+                    plan = (o.get("datePlanIn") or "")[:16]
+                    if soft and plan:
+                        plan_by_soft[soft] = plan
+                # лишаємо плани лише для soft, які ще є в API (не роздуваємо)
                 outages_col.update_one(
                     {"_id": cache_key},
                     {
@@ -950,6 +1000,7 @@ def main() -> int:
                             "ids": list(current_ids),
                             "fps": list(current_fps),
                             "soft_fps": soft_stored,
+                            "plan_by_soft": plan_by_soft,
                             "updated_at": datetime.now(timezone.utc),
                             "count": len(current_ids),
                         }
