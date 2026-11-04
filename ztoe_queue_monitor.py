@@ -741,18 +741,65 @@ def address_key(otg_name: str, city_name: str, street_name: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def _is_no_gpv_text(text: str) -> bool:
+    """Як bot/queue_client.py — статус «не вимикають / не відключають»."""
+    t = (text or "").strip().lower()
+    if not t or re.match(r"^[\d.]+$", t):
+        return False
+    return any(
+        m in t
+        for m in (
+            "не вимикається",
+            "не вимикають",
+            "не відключається",
+            "не відключають",
+        )
+    )
+
+
+def canonicalize_queue(queue: str, subqueue: str) -> tuple[str, str]:
+    """Та сама нормалізація, що в bot/handlers/add_address.py при збереженні адреси і /queue."""
+    raw_q = str(queue or "").strip()
+    raw_sq = str(subqueue or "").strip()
+    if _is_no_gpv_text(raw_q) or _is_no_gpv_text(raw_sq):
+        return "не вимикають, крім аварійних", ""
+    if not re.fullmatch(r"[1-6](\.[12])?", raw_q):
+        m = re.search(r"\b([1-6](?:\.[12])?)\b", raw_q)
+        if m:
+            raw_q = m.group(1)
+        else:
+            low = raw_q.lower()
+            if (
+                len(raw_q) > 12
+                or "оберіть" in low
+                or "рем" in low
+                or "андруш" in low
+            ):
+                raw_q = ""
+    if raw_sq and not re.fullmatch(r"[12]", raw_sq):
+        raw_sq = ""
+    return raw_q, raw_sq
+
+
 def queue_fingerprint(queue: str, subqueue: str, houses: str, note: str) -> str:
+    q, sq = canonicalize_queue(queue, subqueue)
     return "|".join([
-        (queue or "").strip(),
-        (subqueue or "").strip(),
+        q,
+        sq,
         (houses or "").strip(),
         (note or "").strip(),
     ])
 
 
 def queue_number_fp(queue: str, subqueue: str) -> str:
-    """Тільки номер черги+підчерги — для рішення «чи слати notify»."""
-    return f"{(queue or '').strip()}|{(subqueue or '').strip()}"
+    """Канонічний номер черги — те, що бачить користувач після /queue."""
+    q, sq = canonicalize_queue(queue, subqueue)
+    # «1» + підчерга «1» і суцільне «1.1» — один і той самий статус
+    if re.fullmatch(r"[1-6]", q) and re.fullmatch(r"[12]", sq):
+        return f"{q}.{sq}"
+    if re.fullmatch(r"[1-6]\.[12]", q):
+        return q
+    return f"{q}|{sq}"
 
 
 def _short_queue_label(queue: str, subqueue: str, note: str = "") -> str:
@@ -780,9 +827,13 @@ def addr_matches_doc(addr: dict, doc: dict) -> bool:
         == _norm(doc.get("street_name", ""))
     )
 
-def send_log(text: str, message_thread_id: int = 155) -> None:
-    """Пише підсумок у лог-групу ботом ZTOE (ZTOE_BOT_TOKEN).
-    155 — гілка «Перевірка черг».
+# Гілка «Перевірка черг» у лог-групі. Не публічний канал.
+QUEUE_LOG_THREAD_ID = 155
+
+
+def send_log(text: str, message_thread_id: int = QUEUE_LOG_THREAD_ID) -> None:
+    """Підсумок у лог-групу ботом ZTOE (ZTOE_BOT_TOKEN + TELEGRAM_LOG_CHANNEL_ID).
+    Той самий чат і гілка 155, що й звичайна перевірка черг. Користувачам це не йде.
     """
     channel = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or os.getenv("ZTOE_LOG_CHANNEL_ID")
     log_token = os.getenv("ZTOE_BOT_TOKEN")
@@ -907,20 +958,11 @@ def main() -> int:
                 continue
             if not street:
                 skip_reasons["no_street"] += 1
-                log.info(
-                    "skip addr tid=%s keys=%s",
-                    u.get("telegram_id"),
-                    sorted(a.keys()),
-                )
+                log.info("skip addr: no street")
                 continue
             if not city:
                 skip_reasons["no_city"] += 1
-                log.info(
-                    "skip no city tid=%s street=%r keys=%s",
-                    u.get("telegram_id"),
-                    street,
-                    sorted(a.keys()),
-                )
+                log.info("skip addr: no city")
                 continue
             key = address_key(otg, city, street)
             bucket = streets.setdefault(
@@ -961,6 +1003,9 @@ def main() -> int:
     errors = 0
     error_msg_counts: Counter = Counter()
     temp_msg_counts: Counter = Counter()
+    changed_cities: set[str] = set()
+    changed_user_ids: set[int] = set()
+    quiet_sync = os.getenv("ZTOE_QUEUE_SILENT", "").strip().lower() in ("1", "true", "yes")
 
     # run-level cache: key -> street_info dict
     run_cache: dict = {}
@@ -991,7 +1036,7 @@ def main() -> int:
         if last_check and (now - last_check) < skip_delta and key not in run_cache:
             # можна взяти snapshot з directory якщо є queue
             if doc and (doc.get("queue") is not None or doc.get("all_houses")):
-                log.info("skip recent (%s min): %s", SKIP_RECENT_MINUTES, label)
+                log.info("skip recent (%s min)", SKIP_RECENT_MINUTES)
                 skipped_recent += 1
                 # synthetic street_info з directory для per-house update без мережі
                 street_info = {
@@ -1013,13 +1058,13 @@ def main() -> int:
                     continue
                 run_cache[key] = street_info
             else:
-                log.info("skip recent but no snapshot, will fetch: %s", label)
+                log.info("skip recent but no snapshot, will fetch")
 
         if key not in run_cache:
             try:
                 street_info = find_queue(otg, city, street)
             except httpx.TimeoutException as e:
-                log.warning("Timeout для %s: %s", label, e)
+                log.warning("Timeout")
                 directory.update_one(
                     {"_id": key},
                     {
@@ -1057,7 +1102,7 @@ def main() -> int:
 
             if street_info.get("temporary"):
                 msg = street_info.get("message") or street_info.get("error") or "temporary"
-                log.warning("Тимчасово недоступно: %s — %s", label, msg)
+                log.warning("Тимчасово недоступно")
                 directory.update_one(
                     {"_id": key},
                     {
@@ -1077,7 +1122,7 @@ def main() -> int:
 
             if street_info.get("error") and not street_info.get("ok"):
                 msg = street_info.get("message") or street_info.get("error") or "unknown"
-                log.warning("Не знайдено: %s — %s", label, msg)
+                log.warning("Не знайдено")
                 directory.update_one(
                     {"_id": key},
                     {
@@ -1137,10 +1182,7 @@ def main() -> int:
             run_cache[key] = street_info
             checked += 1
             log.info(
-                "fetched %s q=%s.%s houses=%s pairs=%s",
-                label,
-                street_info.get("queue"),
-                street_info.get("subqueue"),
+                "fetched houses=%s pairs=%s",
                 len(street_info.get("all_houses") or []),
                 len(pairs),
             )
@@ -1187,22 +1229,28 @@ def main() -> int:
 
                 house = (a.get("house") or "").strip()
                 info = apply_house_to_info(street_info, house)
-                new_fp = queue_fingerprint(
-                    info.get("queue", ""),
-                    info.get("subqueue", ""),
-                    house or (info.get("houses") or ""),
-                    info.get("note", ""),
-                )
                 old_fp = a.get("queue_fp") or ""
                 old_q = (a.get("queue") or "").strip()
                 old_sq = (a.get("subqueue") or "").strip()
-                new_q = (info.get("queue") or "").strip()
-                new_sq = (info.get("subqueue") or "").strip()
+                new_q, new_sq = canonicalize_queue(
+                    info.get("queue", ""),
+                    info.get("subqueue", ""),
+                )
+                # порожній парсинг не затирає вже збережену чергу і не шле «зміну»
+                if not new_q and old_q:
+                    new_q, new_sq = canonicalize_queue(old_q, old_sq)
+                new_fp = queue_fingerprint(
+                    new_q,
+                    new_sq,
+                    house or (info.get("houses") or ""),
+                    info.get("note", ""),
+                )
 
                 updated = {
                     **a,
                     "queue": new_q,
                     "subqueue": new_sq,
+                    "no_gpv": new_q == "не вимикають, крім аварійних",
                     "queue_houses": info.get("houses", ""),
                     "queue_note": info.get("note", ""),
                     "queue_fp": new_fp,
@@ -1216,28 +1264,31 @@ def main() -> int:
 
                 if old_fp and queue_number_fp(old_q, old_sq) != queue_number_fp(new_q, new_sq):
                     changed += 1
-                    notify_info = info
+                    changed_cities.add(city)
+                    changed_user_ids.add(int(tid))
+                    notify_info = {**info, "queue": new_q, "subqueue": new_sq}
                     notify_label_house = house
-                    notify_old = {"queue": old_q, "subqueue": old_sq, "note": a.get("queue_note") or ""}
-                    log.info(
-                        "Зміна черги: %s house=%s %s|%s → %s|%s",
-                        label, house or "—", old_q, old_sq, new_q, new_sq,
-                    )
+                    notify_old = {
+                        "queue": old_q,
+                        "subqueue": old_sq,
+                        "note": a.get("queue_note") or "",
+                    }
+                    log.info("Зміна черги (адресу в лог не пишемо)")
                 elif not old_fp and new_fp:
-                    log.info(
-                        "Перша фіксація черги (без notify): %s house=%s q=%s|%s",
-                        label, house or "—", new_q, new_sq,
-                    )
+                    log.info("Перша фіксація черги (без notify, адресу в лог не пишемо)")
 
             if not touched:
                 continue
 
+            # Наступна вулиця цього юзера інакше бере знімок з початку прогону
+            # і update_one затирає щойно записані черги.
+            user["addresses"] = new_addrs
             users_col.update_one(
                 {"telegram_id": tid},
                 {"$set": {"addresses": new_addrs}, "$unset": {"address": ""}},
             )
 
-            if notify_info is None:
+            if notify_info is None or quiet_sync:
                 continue
             if not _user_wants(user, "hourly"):
                 continue
@@ -1253,6 +1304,9 @@ def main() -> int:
                 notify_info.get("subqueue", ""),
                 notify_info.get("note", ""),
             )
+            if was == now_lbl:
+                log.info("Підпис не змінився, notify пропущено")
+                continue
             text_msg = (
                 "🔔 <b>Змінилася черга відключень:</b>\n\n"
                 f"<b>{city}, {street}{house_bit}</b>\n\n"
@@ -1272,22 +1326,37 @@ def main() -> int:
 
                 asyncio.run(_send())
                 notified_users += 1
-                log.info("Надіслано %s silent=%s", tid, silent)
+                log.info("Надіслано silent=%s", silent)
                 time.sleep(0.35)
             except Exception as e:
-                log.error("Не вдалося надіслати %s: %s", tid, e)
+                log.error("Не вдалося надіслати сповіщення")
 
-    summary = (
-        f"✅ <b>Перевірка черг</b>\n\n"
-        f"Підписників: <b>{len(users)}</b>\n"
-        f"Унікальних вулиць: <b>{len(streets)}</b>\n"
-        f"Запитів на сайт: <b>{checked}</b>\n"
-        f"Пропущено (недавно): <b>{skipped_recent}</b>\n"
-        f"Черга змінилась: <b>{changed}</b>\n"
-        f"Сповіщено людей: <b>{notified_users}</b>\n"
-        f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>\n"
-        f"Помилок: <b>{errors}</b>"
-    )
+    if quiet_sync:
+        cities = sorted(changed_cities, key=lambda s: s.lower())
+        city_block = "\n".join(f"• {c}" for c in cities) if cities else "—"
+        summary = (
+            "✅ <b>Тихе оновлення черг</b>\n\n"
+            f"Користувачів, у кого замінили чергу: <b>{len(changed_user_ids)}</b>\n"
+            f"Адрес зі зміненою чергою: <b>{changed}</b>\n"
+            f"Населених пунктів: <b>{len(cities)}</b>\n"
+            f"{city_block}\n\n"
+            "Користувачам нічого не надіслано.\n"
+            f"Запитів на сайт: <b>{checked}</b>\n"
+            f"Помилок: <b>{errors}</b>\n"
+            f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>"
+        )
+    else:
+        summary = (
+            f"✅ <b>Перевірка черг</b>\n\n"
+            f"Підписників: <b>{len(users)}</b>\n"
+            f"Унікальних вулиць: <b>{len(streets)}</b>\n"
+            f"Запитів на сайт: <b>{checked}</b>\n"
+            f"Пропущено (недавно): <b>{skipped_recent}</b>\n"
+            f"Черга змінилась: <b>{changed}</b>\n"
+            f"Сповіщено людей: <b>{notified_users}</b>\n"
+            f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>\n"
+            f"Помилок: <b>{errors}</b>"
+        )
     if error_msg_counts:
         summary += "\n\n<b>Помилки</b>\n" + "\n".join(
             f"{m}: {c}" for m, c in error_msg_counts.most_common()
@@ -1301,7 +1370,7 @@ def main() -> int:
         "Готово users=%s streets=%s fetched=%s skip_recent=%s changed=%s notified=%s temp=%s err=%s",
         len(users), len(streets), checked, skipped_recent, changed, notified_users, skipped_temp, errors,
     )
-    send_log(summary)
+    send_log(summary, message_thread_id=QUEUE_LOG_THREAD_ID)
     return 0
 
 
