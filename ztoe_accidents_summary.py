@@ -4,6 +4,7 @@
 
 - Тягне всі записи з /pw_accidents
 - Рахує унікальні вулиці / нас. пункти по РЕМ
+- Сортує РЕМ за відсотком уражених вулиць у районі (а не лише за кількістю)
 - Під кожним РЕМ — топ населених пунктів (географія)
 - Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
 - У Telegram-канал шле ЛИШЕ при рівні CRITICAL
@@ -22,6 +23,7 @@ import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
+import re
 from typing import Any, Dict, List, Set, Tuple
 
 import httpx
@@ -33,31 +35,190 @@ except Exception:
     import pytz
     KYIV = pytz.timezone("Europe/Kyiv")
 
+
+# Telegram HTML message limit; keep margin for safety
+TG_MSG_LIMIT = 4000
+
+
+def split_by_rem_blocks(text: str, limit: int = TG_MSG_LIMIT) -> List[str]:
+    """
+    Ріже довге зведення по межах блоків РЕМ (emoji + <b>Назва</b>).
+    Повертає 1–N частин ≤ limit символів. Header — у першій, footer — в останній.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    lines = text.split("\n")
+    # рядок початку РЕМ: 🔴/🟠/🟡/🟢/⚪ + пробіл + <b>
+    rem_start = re.compile(
+        r"^[\s]*(?:🔴|🟠|🟡|🟢|⚪)\s*<b>[^<]+</b>\s*[—\-]\s*",
+    )
+
+    header: List[str] = []
+    blocks: List[List[str]] = []  # кожен блок = список рядків одного РЕМ
+    footer: List[str] = []
+    current: List[str] | None = None
+    in_rem_zone = False
+    past_blockquote = False
+
+    for line in lines:
+        if rem_start.match(line):
+            in_rem_zone = True
+            if current is not None:
+                blocks.append(current)
+            current = [line]
+            continue
+        if current is not None:
+            # продовження блоку РЕМ (міста, порожні, закриття blockquote)
+            if line.strip() == "</blockquote>":
+                current.append(line)
+                blocks.append(current)
+                current = None
+                past_blockquote = True
+                continue
+            # якщо після blockquote пішли footer-рядки — не чіпаємо current
+            if past_blockquote:
+                footer.append(line)
+            else:
+                current.append(line)
+            continue
+        if in_rem_zone or past_blockquote:
+            footer.append(line)
+        else:
+            header.append(line)
+
+    if current is not None:
+        blocks.append(current)
+
+    # якщо не знайшли жодного РЕМ-блоку — грубий split
+    if not blocks:
+        parts = []
+        rest = text
+        while rest:
+            if len(rest) <= limit:
+                parts.append(rest)
+                break
+            cut = rest.rfind("\n", 0, limit)
+            if cut < limit // 2:
+                cut = limit
+            parts.append(rest[:cut].rstrip())
+            rest = rest[cut:].lstrip("\n")
+        return parts or [text[:limit]]
+
+    header_s = "\n".join(header).rstrip()
+    footer_s = "\n".join(footer).strip()
+    # відкриваємо blockquote лише якщо header його ще не містить
+    open_bq = "<blockquote expandable>"
+    close_bq = "</blockquote>"
+    header_has_bq = open_bq in header_s
+
+    parts: List[str] = []
+    # перша частина: header + скільки влізе РЕМ
+    buf_lines: List[str] = []
+    if header_s:
+        buf_lines.extend(header_s.split("\n"))
+    if not header_has_bq and blocks:
+        # header зазвичай закінчується рядком «Ситуація по РЕМ», blockquote додаємо
+        if open_bq not in "\n".join(buf_lines):
+            buf_lines.append(open_bq)
+
+    def _flush(is_last: bool, extra_footer: str = "") -> None:
+        nonlocal buf_lines
+        body = "\n".join(buf_lines).rstrip()
+        # закрити blockquote якщо відкритий і ще не закритий
+        if open_bq in body and close_bq not in body:
+            body = body + "\n" + close_bq
+        if is_last and extra_footer:
+            body = body + ("\n\n" if body else "") + extra_footer
+        if body:
+            parts.append(body)
+        buf_lines = []
+
+    for bi, block in enumerate(blocks):
+        # прибрати зайві </blockquote> зсередини блоку (ми закриємо самі)
+        clean = [ln for ln in block if ln.strip() != close_bq]
+        candidate_lines = buf_lines + clean
+        candidate = "\n".join(candidate_lines)
+        # запас на закриття blockquote + footer на останній
+        reserve = 20
+        is_last_block = bi == len(blocks) - 1
+        if is_last_block and footer_s:
+            reserve += len(footer_s) + 4
+        if len(candidate) + reserve <= limit or not buf_lines or (
+            # header-only ще порожній від РЕМ — все одно кладемо
+            len(buf_lines) <= (len(header_s.split("\n")) + 2) and not any(
+                rem_start.match(x) for x in buf_lines
+            )
+        ):
+            buf_lines = candidate_lines
+            continue
+        # не влазить — flush поточний (без цього блоку) і почни новий
+        _flush(is_last=False)
+        # нова частина: короткий заголовок-продовження + blockquote
+        buf_lines = [
+            "⚠️ <b>Ситуація по РЕМ</b> (продовження):",
+            open_bq,
+        ] + clean
+
+    _flush(is_last=True, extra_footer=footer_s)
+
+    # safety: якщо щось все одно > limit — грубий доріз
+    fixed: List[str] = []
+    for p in parts:
+        if len(p) <= limit:
+            fixed.append(p)
+            continue
+        rest = p
+        while rest:
+            if len(rest) <= limit:
+                fixed.append(rest)
+                break
+            cut = rest.rfind("\n", 0, limit)
+            if cut < limit // 2:
+                cut = limit
+            fixed.append(rest[:cut].rstrip())
+            rest = rest[cut:].lstrip("\n")
+    return fixed or [text[:limit]]
+
+
 def send_notification(message: str, image_path=None) -> bool:
-    """Шле в TELEGRAM_CHANNEL_ID без preview лінків."""
+    """Шле в TELEGRAM_CHANNEL_ID без preview лінків.
+    Якщо текст довший за ліміт — ріже по межах РЕМ і шле 2–3 повідомлення підряд.
+    """
     token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
     chat_id = os.getenv("TELEGRAM_CHANNEL_ID") or ""
     if not token or not chat_id:
         print("❌ TELEGRAM_BOT_TOKEN або TELEGRAM_CHANNEL_ID не налаштовані")
         return False
-    try:
-        r = httpx.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": message[:4096],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": "true",
-            },
-            timeout=30,
-        )
-        if r.status_code == 200:
-            return True
-        print(f"❌ Telegram send HTTP {r.status_code}: {r.text[:300]}")
+    parts = split_by_rem_blocks(message, TG_MSG_LIMIT)
+    if not parts:
         return False
-    except Exception as e:
-        print(f"❌ Telegram send failed: {e}")
-        return False
+    ok_all = True
+    for i, part in enumerate(parts):
+        try:
+            r = httpx.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": part[:4096],
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                if len(parts) > 1:
+                    print(f"✓ канал part {i+1}/{len(parts)} ({len(part)} символів)")
+            else:
+                print(f"❌ Telegram send HTTP {r.status_code}: {r.text[:300]}")
+                ok_all = False
+        except Exception as e:
+            print(f"❌ Telegram send failed: {e}")
+            ok_all = False
+    return ok_all
 
 
 def _user_wants_region(u: dict) -> bool:
@@ -127,24 +288,39 @@ def send_region_dms(message: str) -> tuple[int, int]:
     targets = [u for u in users if _user_wants_region(u) and u.get("telegram_id")]
     log_to_buffer(f"📬 region DM candidates: {len(targets)} (з {len(users)} notify)")
 
+    parts = split_by_rem_blocks(message, TG_MSG_LIMIT)
+    if not parts:
+        log_to_buffer("⚠️ region DM: порожнє повідомлення після split")
+        return 0, 0
+    if len(parts) > 1:
+        log_to_buffer(f"✂️ region DM split: {len(parts)} parts, lens={[len(p) for p in parts]}")
+
     sent = failed = 0
     sent_quiet = sent_sound = 0
     for u in targets:
         tid = u.get("telegram_id")
         silent = _is_quiet_now(u)
+        user_ok = True
         try:
-            r = httpx.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data={
-                    "chat_id": str(tid),
-                    "text": message[:4096],
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": "true",
-                    "disable_notification": "true" if silent else "false",
-                },
-                timeout=30,
-            )
-            if r.status_code == 200 and (r.json() or {}).get("ok"):
+            for part in parts:
+                r = httpx.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data={
+                        "chat_id": str(tid),
+                        "text": part[:4096],
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": "true",
+                        "disable_notification": "true" if silent else "false",
+                    },
+                    timeout=30,
+                )
+                if not (r.status_code == 200 and (r.json() or {}).get("ok")):
+                    user_ok = False
+                    log_to_buffer(
+                        f"❌ region DM tid={tid}: HTTP {r.status_code} {r.text[:120]}"
+                    )
+                    break
+            if user_ok:
                 sent += 1
                 if silent:
                     sent_quiet += 1
@@ -152,9 +328,6 @@ def send_region_dms(message: str) -> tuple[int, int]:
                     sent_sound += 1
             else:
                 failed += 1
-                log_to_buffer(
-                    f"❌ region DM tid={tid}: HTTP {r.status_code} {r.text[:120]}"
-                )
         except Exception as e:
             failed += 1
             log_to_buffer(f"❌ region DM tid={tid}: {e}")
@@ -253,13 +426,139 @@ API_BASE = (os.getenv("ZTOE_API_BASE") or "").rstrip("/")
 AVARII_ZHOE = (os.getenv("AVARII_ZHOE") or "").strip()
 SUBSCRIBE = (os.getenv("SUBSCRIBE") or "").strip()
 
-# скільки топ-населених пунктів показувати під кожним РЕМ
-TOP_CITIES_PER_REM = 5
+# н.п. під РЕМ: показуємо окремо, якщо ≥ CITY_PCT_MIN % вулиць району
+CITY_PCT_MIN = 1.0
+CITY_LIST_MAX = 20  # захист від занадто довгого списку
 
 CITY_PREFIX = {
     "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
 }
 
+# Покриття району.
+# Вулиці — з API ZTOE (/pw_streets + /pw_cities→otg), ключі без « РЕМ».
+# Н.п. — з довідника addresses_directory (у API pw_cities дублікати, % н.п. там кривий).
+REM_TOTAL_STREETS: Dict[str, int] = {
+    "Житомирський": 2782,
+    "Звягельський": 2474,
+    "Овруцький": 1670,
+    "Попільнянський": 1418,
+    "Коростенський": 1154,
+    "Малинський": 1126,
+    "Олевський": 890,
+    "Баранівський": 871,
+    "Хорошівський": 785,
+    "Радомишльський": 725,
+    "Бердичівський": 714,
+    "Черняхівський": 703,
+    "Чуднівський": 686,
+    "Любарський": 543,
+    "Пулинський": 524,
+    "Романівський": 464,
+    "Андрушівський": 433,
+    "Коростишівський": 404,
+    "Брусилівський": 357,
+}
+
+REM_TOTAL_CITIES: Dict[str, int] = {
+    "Житомирський": 103,
+    "Звягельський": 224,
+    "Овруцький": 286,
+    "Коростенський": 150,
+    "Попільнянський": 101,
+    "Бердичівський": 66,
+    "Малинський": 110,
+    "Баранівський": 60,
+    "Олевський": 60,
+    "Хорошівський": 78,
+    "Радомишльський": 84,
+    "Чуднівський": 60,
+    "Андрушівський": 41,
+    "Коростишівський": 64,
+    "Любарський": 46,
+    "Черняхівський": 58,
+    "Пулинський": 68,
+    "Брусилівський": 36,
+    "Романівський": 63,
+}
+
+# Якщо otg = АТ «Житомиробленерго» (без РЕМ) — підставляємо РЕМ за назвою н.п.
+# Зібрано з /pw_cities (найчастіший otg для назви).
+OBLAST_TOTAL_STREETS = sum(REM_TOTAL_STREETS.values())
+OBLAST_TOTAL_CITIES = sum(REM_TOTAL_CITIES.values())
+
+CITY_TO_REM: Dict[str, str] = {
+    "Малин": "Малинський РЕМ",
+    "Житомир": "Житомирський РЕМ",
+    "Звягель": "Звягельський РЕМ",
+    "Новоград-Волинський": "Звягельський РЕМ",
+    "Бердичів": "Бердичівський РЕМ",
+    "Коростень": "Коростенський РЕМ",
+    "Овруч": "Овруцький РЕМ",
+    "Олевськ": "Олевський РЕМ",
+    "Радомишль": "Радомишльський РЕМ",
+    "Коростишів": "Коростишівський РЕМ",
+    "Андрушівка": "Андрушівський РЕМ",
+    "Баранівка": "Баранівський РЕМ",
+    "Чуднів": "Чуднівський РЕМ",
+    "Любар": "Любарський РЕМ",
+    "Романів": "Романівський РЕМ",
+    "Пулини": "Пулинський РЕМ",
+    "Черняхів": "Черняхівський РЕМ",
+    "Брусилів": "Брусилівський РЕМ",
+    "Попільня": "Попільнянський РЕМ",
+    "Хорошів": "Хорошівський РЕМ",
+    "Головине": "Черняхівський РЕМ",
+    "Іршанськ": "Хорошівський РЕМ",
+    "Великі Низгірці": "Бердичівський РЕМ",
+}
+
+
+def _norm_rem_name(name: str) -> str:
+    """«Звягельський РЕМ» → «Звягельський»."""
+    s = (name or "").strip()
+    s = s.replace(" РЕМ", "").replace(" рем", "").strip()
+    return s
+
+
+def rem_streets_pct(rem_name: str, affected_streets: int) -> float | None:
+    """
+    Відсоток уражених вулиць у РЕМ відносно довідника.
+    Може бути >100%, якщо API дає більше унікальних ключів, ніж є в довіднику.
+    """
+    total = REM_TOTAL_STREETS.get(_norm_rem_name(rem_name))
+    if not total or total <= 0:
+        return None
+    n = max(0, int(affected_streets or 0))
+    return 100.0 * n / total
+
+
+def rem_cities_pct(rem_name: str, affected_cities: int) -> float | None:
+    """Відсоток уражених н.п. у РЕМ (надійніший за вулиці)."""
+    total = REM_TOTAL_CITIES.get(_norm_rem_name(rem_name))
+    if not total or total <= 0:
+        return None
+    n = max(0, int(affected_cities or 0))
+    return min(100.0, 100.0 * n / total)
+
+
+def rem_coverage_pct(
+    rem_name: str, affected_streets: int, affected_cities: int
+) -> tuple[float | None, str]:
+    """
+    Ключ сортування: max(% н.п., % вул.), щоб район з повним покриттям
+    н.п. не програвав через розбіжність довідника по вулицях.
+    """
+    sp = rem_streets_pct(rem_name, affected_streets)
+    cp = rem_cities_pct(rem_name, affected_cities)
+    candidates = []
+    if cp is not None:
+        candidates.append((cp, "cities"))
+    if sp is not None:
+        candidates.append((min(sp, 100.0), "streets"))  # для сорту не роздуваємо >100
+    if not candidates:
+        return None, "streets"
+    candidates.sort(key=lambda x: -x[0])
+    return candidates[0]
 
 
 # Рівень по кількості населених пунктів (область ~1400 н.п.)
@@ -355,14 +654,30 @@ def should_notify_channel(
     return True, f"перше сповіщення за день, рівень {level}"
 
 
-def severity_emoji(streets: int) -> str:
-    if streets >= 400:
+def severity_emoji(streets: int = 0, coverage_pct: float | None = None) -> str:
+    """
+    Колір за % покриття району (як сортування).
+    Якщо % немає — fallback на абсолютну кількість вулиць.
+    """
+    if coverage_pct is not None:
+        p = float(coverage_pct)
+        if p >= 30:
+            return "🔴"
+        if p >= 15:
+            return "🟠"
+        if p >= 5:
+            return "🟡"
+        if p > 0:
+            return "🟢"
+        return "⚪"
+    n = int(streets or 0)
+    if n >= 400:
         return "🔴"
-    if streets >= 150:
+    if n >= 150:
         return "🟠"
-    if streets >= 50:
+    if n >= 50:
         return "🟡"
-    if streets > 0:
+    if n > 0:
         return "🟢"
     return "⚪"
 
@@ -516,8 +831,13 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
         sid = street.get("id")
         oname = (otg.get("name") or "").strip() or "?"
 
+        # АТ «Житомиробленерго» без конкретного РЕМ — пробуємо визначити РЕМ по н.п.
         if "Житомиробленерго" in oname and "РЕМ" not in oname:
-            oname = "Інше (обленерго)"
+            mapped = CITY_TO_REM.get(cname)
+            if mapped:
+                oname = mapped
+            else:
+                oname = "Інше (обленерго)"
 
         street_key = sid if sid is not None else (cname, street.get("name"))
         city_key = cid if cid is not None else cname
@@ -539,12 +859,27 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
         city_counts = {
             c: len(sids) for c, sids in st["city_streets"].items()
         }
-        rem_out[name] = {
+        streets_n = len(st["streets"])
+        cities_n = len(st["cities"])
+        sp = rem_streets_pct(name, streets_n)
+        cp = rem_cities_pct(name, cities_n)
+        cov, cov_kind = rem_coverage_pct(name, streets_n, cities_n)
+        entry: Dict[str, Any] = {
             "records": st["records"],
-            "streets": len(st["streets"]),
-            "cities": len(st["cities"]),
+            "streets": streets_n,
+            "cities": cities_n,
             "city_streets": city_counts,
         }
+        if sp is not None:
+            entry["streets_pct"] = round(sp, 1)
+            entry["streets_total"] = REM_TOTAL_STREETS.get(_norm_rem_name(name))
+        if cp is not None:
+            entry["cities_pct"] = round(cp, 1)
+            entry["cities_total"] = REM_TOTAL_CITIES.get(_norm_rem_name(name))
+        if cov is not None:
+            entry["coverage_pct"] = round(cov, 1)
+            entry["coverage_kind"] = cov_kind
+        rem_out[name] = entry
 
     return {
         "total_records": len(accidents),
@@ -570,39 +905,130 @@ def format_message(
         level_meta = level_from_cities(total_cities)
     _level_code, level_emoji, level_label = level_meta
 
+    cities_pct_obl = None
+    streets_pct_obl = None
+    if OBLAST_TOTAL_CITIES > 0:
+        cities_pct_obl = min(100.0, 100.0 * int(total_cities or 0) / OBLAST_TOTAL_CITIES)
+    if OBLAST_TOTAL_STREETS > 0:
+        streets_pct_obl = min(100.0, 100.0 * int(total_streets or 0) / OBLAST_TOTAL_STREETS)
+
+    header_counts = (
+        f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
+        f"(загалом <b>{total_streets:,}</b> вулиць)"
+    ).replace(",", " ")
+    if cities_pct_obl is not None and streets_pct_obl is not None:
+        header_counts += (
+            f" — <b>{cities_pct_obl:.1f}%</b> н.п. / <b>{streets_pct_obl:.1f}%</b> вул. області"
+        )
+    header_counts += "."
+
     lines: List[str] = [
         f"{level_emoji}<b>{level_label}</b> стан електромереж у Житомирській області",
         "",
-        (
-            f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
-            f"(загалом <b>{total_streets:,}</b> вулиць)."
-        ).replace(",", " "),
+        header_counts,
         "",
         "⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):",
     ]
 
-    rem_sorted = sorted(
-        stats["rem"].items(),
-        key=lambda x: (-x[1]["streets"], -x[1]["cities"], -x[1]["records"]),
-    )
+    def _rem_sort_key(item: Tuple[str, dict]) -> Tuple[float, int, int, int]:
+        """Спочатку за % покриття району (вулиці або н.п.), далі за кількістю."""
+        name, st = item
+        streets = int(st.get("streets") or 0)
+        cities = int(st.get("cities") or 0)
+        pct = st.get("coverage_pct")
+        if pct is None:
+            pct, _ = rem_coverage_pct(name, streets, cities)
+        pct_v = float(pct) if pct is not None else -1.0
+        return (
+            -pct_v,
+            -streets,
+            -cities,
+            -int(st.get("records") or 0),
+        )
+
+    rem_sorted = sorted(stats["rem"].items(), key=_rem_sort_key)
 
     block: List[str] = []
     for name, st in rem_sorted:
         if st["streets"] == 0:
             continue
         short = name.replace(" РЕМ", "").strip()
-        emoji = severity_emoji(st["streets"])
-        block.append(
-            f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
-            f"{st['streets']:,} вул.".replace(",", " ")
-        )
+        streets_s = f"{st['streets']:,}".replace(",", " ")
 
-        cities_sorted = sorted(
+        cp = st.get("cities_pct")
+        sp = st.get("streets_pct")
+        if cp is None:
+            cp = rem_cities_pct(name, st["cities"])
+        if sp is None:
+            sp = rem_streets_pct(name, st["streets"])
+
+        cov = st.get("coverage_pct")
+        if cov is None:
+            cov, _ = rem_coverage_pct(name, st["streets"], st["cities"])
+        emoji = severity_emoji(st["streets"], coverage_pct=cov)
+
+        pct_parts: List[str] = []
+        if cp is not None:
+            pct_parts.append(f"{cp:.1f}% н.п.")
+        if sp is not None:
+            # для показу не роздуваємо понад 100% (розбіжність довідника)
+            pct_parts.append(f"{min(sp, 100.0):.1f}% вул.")
+        if pct_parts:
+            block.append(
+                f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+                f"{streets_s} вул. ({' / '.join(pct_parts)})"
+            )
+        else:
+            block.append(
+                f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+                f"{streets_s} вул."
+            )
+
+        city_items = sorted(
             st.get("city_streets", {}).items(),
             key=lambda x: -x[1],
-        )[:TOP_CITIES_PER_REM]
-        for cname, cnt in cities_sorted:
-            block.append(f"    · {city_label(cname)} — {cnt}")
+        )
+        rem_total = REM_TOTAL_STREETS.get(_norm_rem_name(name))
+        rem_affected = int(st.get("streets") or 0) or 1
+
+        def _city_pct(cnt_i: int) -> float:
+            if rem_total and rem_total > 0:
+                return 100.0 * cnt_i / rem_total
+            return 100.0 * cnt_i / rem_affected
+
+        # окремо — н.п. з ≥ CITY_PCT_MIN % вулиць району; дрібні → «ще N»
+        shown: list = []
+        rest: list = []
+        for cname, cnt in city_items:
+            cnt_i = int(cnt or 0)
+            if _city_pct(cnt_i) >= CITY_PCT_MIN and len(shown) < CITY_LIST_MAX:
+                shown.append((cname, cnt_i))
+            else:
+                rest.append((cname, cnt_i))
+
+        for cname, cnt_i in shown:
+            block.append(
+                f"    · {city_label(cname)} — {cnt_i} вул. ({_city_pct(cnt_i):.1f}%)"
+            )
+
+        if rest:
+            # < CITY_PCT_MIN: один н.п. → лише назва; кілька → назва + «ще N»
+            if len(rest) == 1:
+                cname, cnt_i = rest[0]
+                if cnt_i > 0:
+                    block.append(
+                        f"    · {city_label(cname)} — {cnt_i} вул. "
+                        f"({_city_pct(cnt_i):.1f}%)"
+                    )
+            else:
+                first_name, _first_cnt = rest[0]
+                more = len(rest) - 1
+                rest_streets = sum(c for _, c in rest)
+                if rest_streets > 0:
+                    block.append(
+                        f"    · {city_label(first_name)} + ще {more} нас.п. — "
+                        f"{rest_streets} вул. ({_city_pct(rest_streets):.1f}%)"
+                    )
 
     if block:
         lines.append("<blockquote expandable>")
@@ -668,6 +1094,19 @@ def save_to_mongo(
             last_notified_at = prev.get("last_notified_at")
             last_notified_cities = prev.get("last_notified_cities")
 
+        oc_pct = None
+        os_pct = None
+        if OBLAST_TOTAL_CITIES > 0:
+            oc_pct = round(
+                min(100.0, 100.0 * int(stats["total_cities"] or 0) / OBLAST_TOTAL_CITIES),
+                1,
+            )
+        if OBLAST_TOTAL_STREETS > 0:
+            os_pct = round(
+                min(100.0, 100.0 * int(stats["total_streets"] or 0) / OBLAST_TOTAL_STREETS),
+                1,
+            )
+
         doc = {
             "_id": "latest",
             "as_of": as_of.isoformat(),
@@ -676,6 +1115,8 @@ def save_to_mongo(
             "total_streets": stats["total_streets"],
             "total_cities": stats["total_cities"],
             "zhytomyr_streets": stats["zhytomyr_streets"],
+            "oblast_cities_pct": oc_pct,
+            "oblast_streets_pct": os_pct,
             "rem": stats["rem"],
             "message": message,
             "level": level,
