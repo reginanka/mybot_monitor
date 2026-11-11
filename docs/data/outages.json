@@ -1,0 +1,42 @@
+{
+  "updated_at": "2026-11-11T20:07:00Z",
+  "summary": {
+    "off_percent": 36.5,
+    "off_streets": 7391,
+    "total_streets": 20249,
+    "off_settlements": 615
+  },
+  "raions": [
+    {
+      "name": "Чуднівський",
+      "off_percent": 100.0,
+      "off_streets": 700,
+      "off_settlements": 61,
+      "off_settlements_percent": 100.0
+    },
+    {
+      "name": "Баранівський",
+      "off_percent": 99.7,
+      "off_streets": 910,
+      "off_settlements": 63,
+      "off_settlements_percent": 100.0
+    },
+    {
+      "name": "Житомирський",
+      "off_percent": 51.0,
+      "off_streets": 1510,
+      "off_settlements": 77,
+      "off_settlements_percent": 77.0
+    }
+  ],
+  "data": {
+    "чуднів": 100.0,
+    "великі коровинці": 100.0,
+    "іванопіль": 97.6,
+    "баранівка": 99.4,
+    "дубрівка": 97.4,
+    "м. житомир": 37.7,
+    "зарічани": 95.7,
+    "тетерівка": 79.4
+  }
+}
