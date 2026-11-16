@@ -23,6 +23,9 @@ jobs:
       MONGO_DB: ${{ secrets.MONGO_DB }}
       AVARII_ZHOE: ${{ secrets.AVARII_ZHOE }}
       SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
+      MAP_GITHUB_REPO: ${{ secrets.MAP_GITHUB_REPO }}
+      MAP_GITHUB_TOKEN: ${{ secrets.MAP_GITHUB_TOKEN }}
+      MAP_GITHUB_PATH: ${{ secrets.MAP_GITHUB_PATH }}
 
     steps:
       - name: Checkout repository
