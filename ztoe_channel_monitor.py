@@ -14,12 +14,14 @@
 (порівняння нечутливе до регістру, емодзі, розділових знаків і зайвих пробілів).
 Усе інше (включно з репостами, службовими подіями, постами без тексту) ігнорується.
 
+Лог проходу відправляється в лог-групу (TELEGRAM_LOG_CHANNEL_ID) у гілку LOG_THREAD_ID.
+
 Env:
   MONGO_URI, MONGO_DB          — як у решти модулів
   TELEGRAM_BOT_TOKEN           — бот, що пише в канал
   TELEGRAM_CHANNEL_ID          — канал-приймач
   ZTOE_BOT_TOKEN               — бот для DM підписникам (+ логи)
-  TELEGRAM_LOG_CHANNEL_ID      — лог-група (опційно)
+  TELEGRAM_LOG_CHANNEL_ID      — лог-група
   ZTOE_CHANNEL_URL             — https://t.me/s/<канал> (обов'язково, лише в секретах)
 """
 
@@ -37,7 +39,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from bot_notify import is_quiet_now, load_notify_users
-from log_utils import log_to_buffer, send_log_to_channel
+from log_utils import log_to_buffer as _log_to_buffer
 from mongo_store import get_db
 from telegram_handler import send_photos_sync
 
@@ -60,6 +62,12 @@ STATE_COLLECTION = "channel_monitor_state"
 NOTIFY_KIND = "ztoe_news"
 TEXT_LIMIT = 3500  # запас до 4096 під шапку/посилання
 
+# Гілка (topic) у лог-групі, куди відправляється лог цього крона
+LOG_THREAD_ID = 12135
+# Ліміт Telegram — 4096 символів на повідомлення (після HTML-екранування); з запасом 4000.
+# Якщо лог довший — він відправляється файлом .txt
+LOG_MESSAGE_LIMIT = 4000
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -72,6 +80,75 @@ RELEVANT_PHRASES = (
     "⚡️ Аварійні відключення на Житомирщині скасовано.",
     "на Житомирщині аварійні знеструмлення",
 )
+
+# ---------- лог ----------
+
+_LOG_LINES: List[str] = []
+
+# Службові маркери: текст між ними в лозі загортається в розкриту цитату (<blockquote expandable>)
+_Q_OPEN = "\x01"
+_Q_CLOSE = "\x02"
+
+
+def log_to_buffer(msg: str) -> None:
+    """Пише і в спільний буфер log_utils, і в локальний (для відправки в гілку)."""
+    _LOG_LINES.append(msg)
+    _log_to_buffer(msg)
+
+
+def send_log_to_thread(title: str) -> None:
+    """Відправляє накопичений лог у лог-групу в гілку LOG_THREAD_ID."""
+    chat_id = os.getenv("TELEGRAM_LOG_CHANNEL_ID")
+    token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    if not chat_id or not token:
+        print("Лог у гілку не відправлено: немає TELEGRAM_LOG_CHANNEL_ID / токена бота")
+        return
+    if not _LOG_LINES:
+        return
+
+    raw = "\n".join(_LOG_LINES)
+    plain = raw.replace(_Q_OPEN, "").replace(_Q_CLOSE, "")  # для .txt без розмітки
+    body_html = (
+        html.escape(raw)
+        .replace(_Q_CLOSE + "\n", "</blockquote>")
+        .replace(_Q_CLOSE, "</blockquote>")
+        .replace(_Q_OPEN, "<blockquote expandable>")
+    )
+    text = f"<b>{html.escape(title)}</b>\n\n{body_html}"
+    base = f"https://api.telegram.org/bot{token}"
+
+    try:
+        if len(text) <= LOG_MESSAGE_LIMIT:
+            r = requests.post(
+                f"{base}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                    "message_thread_id": LOG_THREAD_ID,
+                },
+                timeout=20,
+            )
+        else:
+            # Лог завеликий для одного повідомлення → шлемо повний лог файлом .txt
+            filename = f"ztoe_channel_log_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.txt"
+            r = requests.post(
+                f"{base}/sendDocument",
+                data={
+                    "chat_id": chat_id,
+                    "caption": f"<b>{html.escape(title)}</b>\n(лог завеликий — файлом)",
+                    "parse_mode": "HTML",
+                    "message_thread_id": LOG_THREAD_ID,
+                },
+                files={"document": (filename, plain.encode("utf-8"), "text/plain")},
+                timeout=30,
+            )
+        if not (r.status_code == 200 and r.json().get("ok")):
+            print(f"Лог у гілку не відправлено: {r.status_code} {r.text[:300]}")
+    except Exception as e:  # noqa: BLE001
+        print(f"Лог у гілку: виняток {e}")
+
 
 # ---------- парсинг ----------
 
@@ -222,7 +299,16 @@ def run() -> bool:
             else ""
         )
         if reason:
-            log_to_buffer(f"⏭ #{pid} пропущено: {reason}")
+            if reason == "не підходить під фільтр":
+                snippet = " ".join((p["text"] or "").split())  # в один рядок
+                if not snippet:
+                    snippet = "(без тексту)"
+                elif len(snippet) > 200:
+                    snippet = snippet[:200].rstrip() + "…"
+                snippet = snippet.replace(_Q_OPEN, "").replace(_Q_CLOSE, "")
+                log_to_buffer(f"⏭ #{pid} пропущено: {reason}\n{_Q_OPEN}«{snippet}»{_Q_CLOSE}")
+            else:
+                log_to_buffer(f"⏭ #{pid} пропущено: {reason}")
             save_last_id(col, pid)
             continue
 
@@ -247,9 +333,10 @@ def main() -> int:
         log_to_buffer(f"❌ Критична помилка ZTOE channel monitor: {e}")
     finally:
         if active:
-            send_log_to_channel("📊 ЛОГ ВИКОНАННЯ СКРИПТА · ЖОЕ КАНАЛ")
+            send_log_to_thread("📊 ЛОГ ВИКОНАННЯ СКРИПТА · ЖОЕ КАНАЛ")
     return code
 
 
 if __name__ == "__main__":
     sys.exit(main())
+  
