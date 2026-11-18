@@ -15,6 +15,8 @@
   детекції змін в API і продовжень аварій.
 - Per-user дедуп у колекції user_outage_notified:
   ключ = telegram_id + notify_dedup_key.
+  Запис пишеться лише після успішної відправки в Telegram,
+  тож збій розсилки не «з’їдає» сповіщення.
   Завдяки цьому користувач, який додав адресу ПІСЛЯ появи аварії,
   все одно отримає сповіщення про поточні активні відключення.
 - matches_building нормалізує номери (033 ≡ 33, 33а ≡ 33А тощо).
@@ -38,16 +40,17 @@ from __future__ import annotations
 import re
 
 import asyncio
+import html
 import logging
 import os
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 from pymongo import MongoClient, UpdateOne
 from telegram import Bot
+from telegram.request import HTTPXRequest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -365,6 +368,11 @@ def format_forecast_period(date_event: str, date_plan: str) -> str:
     return ""
 
 
+def h(value) -> str:
+    """Екранує текст для Telegram HTML. Інакше «<» у koment/будинках ламає parse_mode."""
+    return html.escape("" if value is None else str(value), quote=False)
+
+
 def format_outage(outage: dict, user_house: str = "") -> str:
     """
     Формує текст однієї події.
@@ -378,16 +386,17 @@ def format_outage(outage: dict, user_house: str = "") -> str:
       📌 Тип
       🔔 для будинків: ...
     """
-    city = (outage.get("city") or {}).get("name", "?")
-    street = (outage.get("street") or {}).get("name", "?")
-    buildings = (outage.get("buildingNames") or "").strip()
+    city = h((outage.get("city") or {}).get("name", "?"))
+    street = h((outage.get("street") or {}).get("name", "?"))
+    buildings = h((outage.get("buildingNames") or "").strip())
     date_event_raw = outage.get("dateEvent") or ""
     date_plan_raw = outage.get("datePlanIn") or ""
-    date_plan = (date_plan_raw or "")[:16].replace("T", " ")
+    date_plan = h((date_plan_raw or "")[:16].replace("T", " "))
     icon, type_name, type_desc = outage_notify_label(outage)
-    koment = (outage.get("koment") or "").strip()
+    type_name, type_desc = h(type_name), h(type_desc)
+    koment = h((outage.get("koment") or "").strip())
 
-    house = (user_house or "").strip()
+    house = h((user_house or "").strip())
     addr_line = f"{city}, {street}"
     if house:
         addr_line += f", {house}"
@@ -395,8 +404,8 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     # --- видима шапка ---
     if outage.get("_plan_updated"):
         text = f"⏱ <b>Оновлення:</b> {addr_line}"
-        was = (outage.get("_plan_was") or "")[:16].replace("T", " ")
-        period = format_forecast_period(date_event_raw, date_plan_raw)
+        was = h((outage.get("_plan_was") or "")[:16].replace("T", " "))
+        period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if was and date_plan and was != date_plan:
             text += f"\n⏳ План: <s>{was}</s> → <b>{date_plan}</b>"
             if period:
@@ -405,7 +414,7 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             text += f"\n📅 {period}"
     else:
         text = f"{icon} <b>{addr_line}</b>"
-        period = format_forecast_period(date_event_raw, date_plan_raw)
+        period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
             text += f"\n📅 {period}"
 
@@ -919,20 +928,241 @@ def format_schedule_block_for_notify(
     return f"<blockquote expandable>{body}</blockquote>"
 
 
-def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
+TG_TEXT_LIMIT = 4096
+_HTML_TAG_RE = re.compile(
+    r"<(/?)(blockquote|b|u|s|i|code|pre|a|tg-spoiler)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def fit_telegram_html(text: str, limit: int = TG_TEXT_LIMIT) -> str:
+    """Обрізає текст до ліміту Telegram і закриває теги, які розріз обірвав.
+
+    text[:4096] лишав <blockquote> без </blockquote> —
+    Telegram відповідав Can't parse entities.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+
+    def _stack(fragment: str) -> list:
+        stack: list = []
+        for m in _HTML_TAG_RE.finditer(fragment):
+            name = m.group(2).lower()
+            if m.group(1):
+                if name in stack:
+                    while stack and stack[-1] != name:
+                        stack.pop()
+                    if stack and stack[-1] == name:
+                        stack.pop()
+            else:
+                stack.append(name)
+        return stack
+
+    cut = text[:limit]
+    lt, gt = cut.rfind("<"), cut.rfind(">")
+    if lt > gt:
+        cut = cut[:lt]
+    nl = cut.rfind("\n")
+    if nl >= int(limit * 0.5):
+        cut = cut[:nl]
+    cut = cut.rstrip()
+    closers = "".join(f"</{name}>" for name in reversed(_stack(cut)))
+    if len(cut) + len(closers) > limit:
+        cut = cut[: max(0, limit - len(closers))]
+        lt, gt = cut.rfind("<"), cut.rfind(">")
+        if lt > gt:
+            cut = cut[:lt]
+        cut = cut.rstrip()
+        closers = "".join(f"</{name}>" for name in reversed(_stack(cut)))
+        if len(cut) + len(closers) > limit:
+            cut = cut[: max(0, limit - len(closers))].rstrip()
+    return (cut + closers).strip()
+
+
+def pack_html_messages(
+    blocks: List[str],
+    header: str,
+    limit: int = TG_TEXT_LIMIT,
+) -> List[str]:
+    """Складає блоки в кілька повідомлень, кожне ≤ limit і з закритими тегами.
+
+    Завеликий блок (довгий список будинків) ділиться на частини, а не обрізається.
+    """
+    msgs: List[str] = []
+    cur = header.strip()
+    cont = "⚠️ <b>Продовження:</b>"
+    budget = limit - len(cont) - 4
+    for raw in blocks:
+        for block in _split_block_for_telegram((raw or "").strip(), max(200, budget)):
+            if not block:
+                continue
+            candidate = f"{cur}\n\n{block}" if cur else block
+            if len(candidate) <= limit:
+                cur = candidate
+                continue
+            if cur:
+                msgs.append(cur)
+            cur = f"{cont}\n\n{block}"
+            if len(cur) > limit:
+                cur = block
+    if cur:
+        msgs.append(cur)
+    return [m for m in msgs if m]
+
+
+def _split_block_for_telegram(block: str, limit: int) -> List[str]:
+    """Ділить один HTML-блок, не викидаючи хвіст списку будинків."""
+    block = (block or "").strip()
+    if not block or len(block) <= limit:
+        return [block] if block else []
+
+    m = re.match(
+        r"^(?P<pre>.*?)<blockquote(?P<attrs>\s[^>]*)?>(?P<body>.*)</blockquote>\s*$",
+        block,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not m:
+        return _pack_plain_chunks(block, limit)
+
+    pre = (m.group("pre") or "").strip()
+    open_tag = f"<blockquote{m.group('attrs') or ''}>"
+    close_tag = "</blockquote>"
+    body = (m.group("body") or "").strip()
+    overhead = len(open_tag) + len(close_tag) + 1
+    first_limit = limit - overhead - (len(pre) + 1 if pre else 0)
+    rest_limit = limit - overhead
+    first_limit = max(120, first_limit)
+    rest_limit = max(120, rest_limit)
+    parts = _pack_plain_chunks(body, min(first_limit, rest_limit))
+    out: List[str] = []
+    for i, part in enumerate(parts):
+        quoted = f"{open_tag}{part}{close_tag}"
+        if i == 0 and pre:
+            quoted = f"{pre}\n{quoted}"
+        if len(quoted) > limit:
+            # запасний розріз уже всередині частини
+            for sub in _pack_plain_chunks(part, max(80, limit - overhead - len(pre) - 1)):
+                piece = f"{open_tag}{sub}{close_tag}"
+                if i == 0 and pre and not out:
+                    piece = f"{pre}\n{piece}"
+                out.append(piece)
+        else:
+            out.append(quoted)
+    return out
+
+
+def _pack_plain_chunks(text: str, limit: int) -> List[str]:
+    atoms: List[str] = []
+    for line in (text or "").split("\n"):
+        if len(line) <= limit or "<" in line:
+            atoms.append(line)
+            continue
+        buf = ""
+        bits = line.split(", ")
+        for i, bit in enumerate(bits):
+            piece = bit if i == len(bits) - 1 else bit + ", "
+            if buf and len(buf) + len(piece) > limit:
+                atoms.append(buf.rstrip())
+                buf = piece
+            else:
+                buf += piece
+        if buf:
+            atoms.append(buf.rstrip())
+    if not atoms:
+        return []
+    chunks: List[str] = []
+    cur = ""
+    for atom in atoms:
+        nxt = atom if not cur else cur + "\n" + atom
+        if cur and len(nxt) > limit:
+            chunks.append(cur)
+            cur = atom
+        else:
+            cur = nxt
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _building_identity(token: str) -> str:
+    """'12 А' == '12а' == '12-А'. '6' і '6А - Г' лишаються різними."""
+    return (
+        (token or "")
+        .strip()
+        .lower()
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("–", "")
+        .replace("—", "")
+    )
+
+
+def merge_building_names(*lists: str) -> str:
+    """Зліва направо: номери з наступного запису дописуються, якщо їх ще не було."""
+    seen: set = set()
+    out: List[str] = []
+    for raw in lists:
+        for part in (raw or "").replace(";", ",").split(","):
+            part = " ".join(part.split())
+            if not part:
+                continue
+            key = _building_identity(part)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(part)
+    return ", ".join(out)
+
+
+def _msg_dedup_key(outage: dict, house: str) -> str:
+    """Одна адреса + той самий початок і кінець.
+
+    Шкільна і ШКІЛЬНА зливаються. Якщо в іншому записі відключення довше
+    (інший datePlanIn / dateEvent) — ключ інший, сповіщення йде окремо.
+    """
+    street = outage.get("street") or {}
+    sname = _norm_street(street.get("name") or "")
+    city = (outage.get("city") or {}).get("id") or (outage.get("city") or {}).get("name") or ""
+    start = (outage.get("dateEvent") or "")[:16]
+    end = (outage.get("datePlanIn") or "")[:16]
+    hse = (house or "").strip().lower().lstrip("0") or "0"
+    return f"{city}|{sname}|{hse}|{start}|{end}"
+
+
+def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
     """
     items: [(outage, addr), ...]
-    Верх: список подій з датами.
-    Низ: графік на кожен день покриття (від сьогодні / старту до кінця плану).
+    Усі події, без стелі «перші 10».
+    Ділиться на кілька повідомлень лише коли не влазить у 4096 символів Telegram.
     """
-    lines = ["⚠️ <b>Нові відключення по твоїх адресах:</b>", ""]
+    header = "⚠️ <b>Нові відключення по твоїх адресах:</b>"
+    blocks: List[str] = []
     seen_sched: set = set()
+    grouped: List[Tuple[dict, dict]] = []
+    group_at: Dict[str, int] = {}
+    for outage, addr in items:
+        user_house = str(addr.get("house") or addr.get("building") or "").strip()
+        ev_key = _msg_dedup_key(outage, user_house)
+        # Той самий інтервал — не друге повідомлення, а допис номерів будинків.
+        # Довший (або інший) інтервал має інший ключ і лишається окремою подією.
+        if ev_key in group_at:
+            prev, _prev_addr = grouped[group_at[ev_key]]
+            prev["buildingNames"] = merge_building_names(
+                prev.get("buildingNames") or "",
+                outage.get("buildingNames") or "",
+            )
+            if not (prev.get("koment") or "").strip() and (outage.get("koment") or "").strip():
+                prev["koment"] = outage.get("koment")
+            continue
+        group_at[ev_key] = len(grouped)
+        grouped.append((dict(outage), addr))
+
     # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
-    for outage, addr in items[:10]:
+    for outage, addr in grouped:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
-        lines.append(format_outage(outage, user_house=user_house))
-        lines.append("")
+        blocks.append(format_outage(outage, user_house=user_house))
         ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
         if not ymds:
             ymds = [_outage_day_ymd(outage)]
@@ -947,11 +1177,10 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
             try:
                 block = format_schedule_block_for_notify(db, addr, outage, ymd=ymd)
                 if block:
-                    lines.append(block)
-                    lines.append("")
+                    blocks.append(block)
             except Exception as e:
                 log.warning("schedule block: %s", e)
-    return "\n".join(lines).strip()
+    return pack_html_messages(blocks, header)
 
 
 def _norm_street(name: str) -> str:
@@ -968,6 +1197,38 @@ def _norm_street(name: str) -> str:
     s = s.replace("'", "").replace("’", "").replace("`", "")
     s = " ".join(s.split())
     return s
+
+
+def remember_user_notified(col, tid: int, outage: dict, addr: dict) -> None:
+    """Фіксує дедуп лише після того, як Telegram прийняв повідомлення."""
+    house = str(addr.get("house") or addr.get("building") or "")
+    dkey = notify_dedup_key(outage, house)
+    otg_raw = addr.get("otg_id") or addr.get("otgId") or 0
+    city_raw = addr.get("city_id") or addr.get("cityId") or 0
+    try:
+        otg_id = int(otg_raw)
+    except (TypeError, ValueError):
+        otg_id = 0
+    try:
+        city_id = int(city_raw) if city_raw else 0
+    except (TypeError, ValueError):
+        city_id = 0
+    col.update_one(
+        {"_id": f"{int(tid)}:{dkey}"},
+        {
+            "$set": {
+                "telegram_id": int(tid),
+                "dedup_key": dkey,
+                "notified_at": datetime.now(timezone.utc),
+                "expires_at": datetime.now(timezone.utc)
+                + timedelta(days=USER_NOTIFIED_TTL_DAYS),
+                "otg_id": otg_id,
+                "city_id": city_id,
+                "house": house,
+            }
+        },
+        upsert=True,
+    )
 
 
 def matches_street(outage: dict, street_id, street_name: str) -> bool:
@@ -1144,7 +1405,6 @@ def main() -> int:
     unique_otgs = sorted({otg for otg, _ in groups})
     log.info("users=%s groups=%s unique_otgs=%s", len(users), len(groups), len(unique_otgs))
 
-    bot = Bot(token=bot_token)
     notified: Dict[int, list] = {}
     groups_checked = 0
 
@@ -1400,25 +1660,6 @@ def main() -> int:
                         matched_fps.add(fp)
                         already_keys.add(dkey)
 
-                        # фіксуємо, що цій людині вже слали
-                        notify_id = f"{int(tid)}:{dkey}"
-                        notified_col.update_one(
-                            {"_id": notify_id},
-                            {
-                                "$set": {
-                                    "telegram_id": int(tid),
-                                    "dedup_key": dkey,
-                                    "notified_at": datetime.now(timezone.utc),
-                                    "expires_at": datetime.now(timezone.utc)
-                                    + timedelta(days=USER_NOTIFIED_TTL_DAYS),
-                                    "otg_id": otg_id,
-                                    "city_id": city_id,
-                                    "house": house,
-                                }
-                            },
-                            upsert=True,
-                        )
-
                 log.info(
                     "otg=%s city=%s matched_active=%s (addrs=%s active=%s)",
                     otg_id,
@@ -1543,61 +1784,102 @@ def main() -> int:
             if tid_u is not None:
                 _user_by_tid[int(tid_u)] = _u
 
-    for tid, item_list in notified.items():
-        # [(outage, addr), ...]
-        text = build_notify_message(db, item_list)
-        silent = is_quiet_now(_user_by_tid.get(int(tid)))
-
-        async def _send(chat_id=tid, body=text, silent=silent):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=body[:4096],
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                disable_notification=silent,
-            )
-
-        try:
-            asyncio.run(_send())
-            sent += 1
-            if silent:
-                sent_quiet += 1
-            else:
-                sent_sound += 1
-            log.info("Надіслано %s (outages=%s silent=%s)", tid, len(item_list), silent)
-            time.sleep(0.4)
-        except Exception as e:
-            log.error("Send fail %s: %s", tid, e)
-
     n_events = sum(len(v) for v in notified.values())
-    summary = (
-        f"✅ Перевірка відключень\n"
-        f"Підписників: {len(users)}\n"
-        f"Локацій: {groups_checked}\n"
-        f"Подій для розсилки: {n_events}\n"
-        f"Сповіщень: {sent} (🔊={sent_sound} 🔇={sent_quiet})"
-    )
-    log.info("%s", summary.replace("\n", " | "))
-
     log_chat = (
         os.getenv("TELEGRAM_LOG_CHANNEL_ID")
         or os.getenv("ADMIN_CHAT_ID")
         or os.getenv("TELEGRAM_CHAT_ID")
     )
-    if log_chat:
+
+    async def _dispatch() -> None:
+        """Один event loop на всю розсилку.
+
+        Кілька asyncio.run() закривають loop, а HTTPXRequest бота лишається
+        прив’язаним до першого — звідси 'Event loop is closed' і Pool timeout.
+        """
+        nonlocal sent, sent_quiet, sent_sound
+        request = HTTPXRequest(
+            connection_pool_size=8,
+            pool_timeout=10.0,
+            connect_timeout=10.0,
+            read_timeout=20.0,
+            write_timeout=20.0,
+        )
+        bot = Bot(token=bot_token, request=request)
         try:
+            for tid, item_list in notified.items():
+                texts = build_notify_message(db, item_list)
+                silent = is_quiet_now(_user_by_tid.get(int(tid)))
+                failed = False
+                for part_i, text in enumerate(texts):
+                    try:
+                        await bot.send_message(
+                            chat_id=tid,
+                            text=fit_telegram_html(text),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                            disable_notification=silent,
+                        )
+                    except Exception as e:
+                        log.error(
+                            "Send fail %s part %s/%s: %s",
+                            tid,
+                            part_i + 1,
+                            len(texts),
+                            e,
+                        )
+                        failed = True
+                        break
+                    if part_i + 1 < len(texts):
+                        await asyncio.sleep(0.25)
+                if failed:
+                    continue
 
-            async def _log():
-                # 153 — гілка «Аварії, ремонти крон»
-                await bot.send_message(
-                    chat_id=int(log_chat),
-                    text=summary,
-                    message_thread_id=153,
+                for outage, addr in item_list:
+                    if not isinstance(addr, dict):
+                        continue
+                    try:
+                        remember_user_notified(notified_col, int(tid), outage, addr)
+                    except Exception as e:
+                        log.error("mark notified fail %s: %s", tid, e)
+
+                sent += 1
+                if silent:
+                    sent_quiet += 1
+                else:
+                    sent_sound += 1
+                log.info(
+                    "Надіслано %s (outages=%s parts=%s silent=%s)",
+                    tid,
+                    len(item_list),
+                    len(texts),
+                    silent,
                 )
+                await asyncio.sleep(0.35)
 
-            asyncio.run(_log())
-        except Exception as e:
-            log.warning("log channel: %s", e)
+            summary = (
+                f"✅ Перевірка відключень\n"
+                f"Підписників: {len(users)}\n"
+                f"Локацій: {groups_checked}\n"
+                f"Подій для розсилки: {n_events}\n"
+                f"Сповіщень: {sent} (🔊={sent_sound} 🔇={sent_quiet})"
+            )
+            log.info("%s", summary.replace("\n", " | "))
+
+            if log_chat:
+                try:
+                    # 153 — гілка «Аварії, ремонти крон»
+                    await bot.send_message(
+                        chat_id=int(log_chat),
+                        text=summary,
+                        message_thread_id=153,
+                    )
+                except Exception as e:
+                    log.warning("log channel: %s", e)
+        finally:
+            await bot.shutdown()
+
+    asyncio.run(_dispatch())
 
     log.info("Готово groups=%s sent=%s events=%s", groups_checked, sent, n_events)
     return 0
