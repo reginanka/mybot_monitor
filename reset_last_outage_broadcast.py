@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-
+"""
+замінює всім останні аварії на фолс, замість тру для розсилки
+"""
 from __future__ import annotations
 
 import os
@@ -7,8 +9,10 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from pymongo import MongoClient
-
-SKIP_ID = int(os.getenv("SKIP_TELEGRAM_ID", "80958502"))
+"""
+треба внести айді кому не міняти, замість зірочок
+"""
+SKIP_ID = int(os.getenv("SKIP_TELEGRAM_ID", "****"))
 GAP = timedelta(minutes=int(os.getenv("LAST_RUN_GAP_MINUTES", "120")))
 DRY = os.getenv("DRY_RUN", "").strip().lower() in {"1", "true", "yes"}
 
