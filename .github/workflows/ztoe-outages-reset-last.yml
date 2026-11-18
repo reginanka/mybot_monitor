@@ -1,0 +1,35 @@
+name: ZTOE reset last outage broadcast
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = лише лог, без видалення"
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
+
+concurrency:
+  group: ztoe-outages
+  cancel-in-progress: false
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      MONGO_URI: ${{ secrets.MONGO_URI }}
+      MONGO_DB: ${{ secrets.MONGO_DB }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      SKIP_TELEGRAM_ID: "80958502"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install "pymongo>=4.6"
+      - run: python reset_last_outage_broadcast.py
