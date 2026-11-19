@@ -778,7 +778,7 @@
       "queue_key": "2.1",
       "date": "19.11.2026",
       "span": "00:00-00:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -786,7 +786,7 @@
       "queue_key": "2.1",
       "date": "19.11.2026",
       "span": "00:30-01:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -1164,7 +1164,7 @@
       "queue_key": "2.2",
       "date": "19.11.2026",
       "span": "00:00-00:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -1172,7 +1172,7 @@
       "queue_key": "2.2",
       "date": "19.11.2026",
       "span": "00:30-01:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 2,
@@ -3866,7 +3866,7 @@
       "queue_key": "6.1",
       "date": "19.11.2026",
       "span": "00:00-00:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -3874,7 +3874,7 @@
       "queue_key": "6.1",
       "date": "19.11.2026",
       "span": "00:30-01:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4252,7 +4252,7 @@
       "queue_key": "6.2",
       "date": "19.11.2026",
       "span": "00:00-00:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4260,7 +4260,7 @@
       "queue_key": "6.2",
       "date": "19.11.2026",
       "span": "00:30-01:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
