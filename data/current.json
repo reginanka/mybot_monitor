@@ -4066,7 +4066,7 @@
       "queue_key": "6.1",
       "date": "23.11.2026",
       "span": "12:30-13:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4074,7 +4074,7 @@
       "queue_key": "6.1",
       "date": "23.11.2026",
       "span": "13:00-13:30",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
@@ -4082,7 +4082,7 @@
       "queue_key": "6.1",
       "date": "23.11.2026",
       "span": "13:30-14:00",
-      "color": "white"
+      "color": "red"
     },
     {
       "cherga": 6,
