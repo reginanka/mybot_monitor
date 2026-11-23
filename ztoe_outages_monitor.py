@@ -15,9 +15,13 @@
   або міняє id/час замість оновлення. Ми агрегуємо non-GPV записи по addr_day
   і порівнюємо агреговані (start, end) з попереднім знімком.
 - Зміна min(start)/max(end) на тому самому addr_day → «⏱ Зміна періоду»
-  з Було/Стало; блок графіка знизу — актуальне об’єднання інтервалів.
-- Якщо в агрегації є пізніший старт з /pw_accidents (напр. 09:28 при плані 08:00)
-  → у тексті додається «ℹ️ Фактичний старт робіт: 09:28».
+  з Було/Стало (лише якщо рядки після форматування різняться);
+  блок графіка знизу — актуальне об’єднання інтервалів.
+- Інтервал той самий, але з’явився пізніший старт з /pw_accidents
+  (напр. план 08:00–18:00 уже був, accident 09:28) → окреме
+  «ℹ️ Фактичний старт робіт» без Було/Стало (дедуп actual|…).
+- Якщо план+accident в одному першому fetch → нове сповіщення з рядком
+  «Фактичний старт» у звичайному тексті.
 - Новий addr_day → нове сповіщення. Повне зникнення addr_day до datePlanIn
   (після CANCEL_MISS_RUNS пропусків) → «Скасовано».
 - Після успішного повного fetch записи, яких більше немає в API для цієї
@@ -500,8 +504,11 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     """
     Формує текст однієї події.
 
+    Тип події (нове / зміна / старт / скасування) — у заголовку повідомлення,
+    тут лише адреса 📍 і деталі, без дублювання типу в шапці блоку.
+
     Видима частина:
-      🔴 Місто, вул. X, 33
+      📍 Місто, вул. X, 33
       📅 Прогнозований період: ...
 
     Під expandable-цитатою (якщо є що ховати):
@@ -514,7 +521,6 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     buildings = h((outage.get("buildingNames") or "").strip())
     date_event_raw = outage.get("dateEvent") or ""
     date_plan_raw = outage.get("datePlanIn") or ""
-    date_plan = h((date_plan_raw or "")[:16].replace("T", " "))
     icon, type_name, type_desc = outage_notify_label(outage)
     type_name, type_desc = h(type_name), h(type_desc)
     koment = h((outage.get("koment") or "").strip())
@@ -524,22 +530,42 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     if house:
         addr_line += f", {house}"
 
-    # --- видима шапка ---
+    # --- видима шапка (тип — у header повідомлення, тут 📍 + деталі) ---
     actual_hhmm = _fmt_hhmm_from_iso(str(outage.get("_actual_start") or ""))
 
     if outage.get("_cancelled"):
-        # _fixed_early: період уже почався, світло повернули раніше кінця
+        # Запис зник з API до кінця плану.
+        # _fixed_early: період уже йшов — час завершення це прохід скрипта.
         if outage.get("_fixed_early"):
-            text = f"✅ <b>Усунуто раніше:</b> {addr_line}"
-            text += "\nАварійні роботи завершили раніше."
+            text = f"📍 {addr_line}"
+            done = datetime.now(_kyiv_zone()).strftime("%H:%M")
+            text += f"\n✅ Завершили о {h(done)}"
         else:
-            text = f"✅ <b>Скасовано:</b> {addr_line}"
+            text = f"📍 {addr_line}"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
-            # період закреслюємо — його вже немає в графіку
-            text += f"\n📅 <s>{period}</s>"
+            text += f"\n📅 {period}"
+    elif outage.get("_finished_early"):
+        # Кінець урізали, і новий кінець уже в минулому — роботи вже не йдуть
+        text = f"📍 {addr_line}"
+        done_hhmm = _fmt_hhmm_from_iso(date_plan_raw)
+        if done_hhmm:
+            text += f"\n✅ Завершили о {h(done_hhmm)}"
+        was_event = outage.get("_was_dateEvent") or ""
+        was_plan = outage.get("_was_datePlanIn") or ""
+        was_period = h(format_forecast_period(was_event, was_plan)) if (was_event or was_plan) else ""
+        if was_period:
+            text += f"\n📅 Було: <s>{was_period}</s>"
+    elif outage.get("_actual_start_only"):
+        # Інтервал той самий — лише факт старту (заголовок повідомлення вже про це)
+        text = f"📍 {addr_line}"
+        if actual_hhmm:
+            text += f"\n🕐 Фактичний старт робіт: {h(actual_hhmm)}"
+        period = h(format_forecast_period(date_event_raw, date_plan_raw))
+        if period:
+            text += f"\n📅 {period}"
     elif outage.get("_plan_updated"):
-        text = f"⏱ <b>Зміна періоду:</b> {addr_line}"
+        text = f"📍 {addr_line}"
         was_event = outage.get("_was_dateEvent") or ""
         was_plan = outage.get("_plan_was") or outage.get("_was_datePlanIn") or ""
         was_period = h(format_forecast_period(was_event, was_plan)) if (was_event or was_plan) else ""
@@ -548,6 +574,7 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             if was:
                 was_period = was
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
+        # Було/Стало лише коли після форматування рядки реально різняться
         if was_period and period and was_period != period:
             text += f"\n⏳ Було: <s>{was_period}</s>"
             text += f"\n📅 Стало: {period}"
@@ -555,15 +582,14 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             text += f"\n📅 {period}"
         elif was_period:
             text += f"\n⏳ Було: <s>{was_period}</s>"
-        # Фактичний старт робіт (план був раніше, accidents приніс точніший час)
         if actual_hhmm:
             text += f"\nℹ️ Фактичний старт робіт: {h(actual_hhmm)}"
     else:
+        # Нова подія — іконка типу + адреса
         text = f"{icon} <b>{addr_line}</b>"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
             text += f"\n📅 {period}"
-        # Якщо злили план + фактичний старт у одному fetch — коротко пояснити
         if actual_hhmm:
             text += f"\nℹ️ Фактичний старт робіт: {h(actual_hhmm)}"
 
@@ -1279,22 +1305,29 @@ def _msg_dedup_key(outage: dict, house: str) -> str:
     return f"{city}|{sname}|{hse}|{start}|{end}"
 
 
-def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
-    """
-    items: [(outage, addr), ...]
-    Усі події, без стелі «перші 10».
-    Ділиться на кілька повідомлень лише коли не влазить у 4096 символів Telegram.
-    """
-    header = "⚠️ <b>Нові відключення по твоїх адресах:</b>"
+def _build_notify_blocks(
+    db,
+    items: List[Tuple[dict, dict]],
+    *,
+    with_schedule: bool = True,
+) -> List[str]:
+    """Збирає HTML-блоки подій (+ графіків) без заголовка."""
     blocks: List[str] = []
     seen_sched: set = set()
     grouped: List[Tuple[dict, dict]] = []
     group_at: Dict[str, int] = {}
     for outage, addr in items:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
-        ev_key = _msg_dedup_key(outage, user_house)
+        if outage.get("_actual_start_only"):
+            kind = "actual"
+        elif outage.get("_finished_early"):
+            kind = "done"
+        elif outage.get("_plan_updated"):
+            kind = "plan"
+        else:
+            kind = "event"
+        ev_key = f"{kind}|" + _msg_dedup_key(outage, user_house)
         # Той самий інтервал — не друге повідомлення, а допис номерів будинків.
-        # Довший (або інший) інтервал має інший ключ і лишається окремою подією.
         if ev_key in group_at:
             prev, _prev_addr = grouped[group_at[ev_key]]
             prev["buildingNames"] = merge_building_names(
@@ -1307,11 +1340,12 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
         group_at[ev_key] = len(grouped)
         grouped.append((dict(outage), addr))
 
-    # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
     for outage, addr in grouped:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
         blocks.append(format_outage(outage, user_house=user_house))
+        if not with_schedule:
+            continue
         ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
         if not ymds:
             ymds = [_outage_day_ymd(outage)]
@@ -1319,17 +1353,85 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
         city = (addr.get("city_name") or "")
         street = (addr.get("street_name") or "")
         for ymd in ymds:
-            key = f"{lab}|{ymd}|{city}|{street}"
-            if key in seen_sched:
+            skey = f"{lab}|{ymd}|{city}|{street}"
+            if skey in seen_sched:
                 continue
-            seen_sched.add(key)
+            seen_sched.add(skey)
             try:
                 block = format_schedule_block_for_notify(db, addr, outage, ymd=ymd)
                 if block:
                     blocks.append(block)
             except Exception as e:
                 log.warning("schedule block: %s", e)
-    return pack_html_messages(blocks, header)
+    return blocks
+
+
+def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
+    """
+    items: [(outage, addr), ...]
+
+    Окремі заголовки без дублювання типу в тілі:
+      • нові → «Нові відключення…»
+      • зміна інтервалу → «Зміна періоду запланованих робіт…»
+      • кінець урізали і він уже минув → «Роботи … завершено»
+      • лише фактичний старт → «Планові роботи … розпочато»
+    """
+    if not items:
+        return []
+    actual_items = [
+        (o, a) for o, a in items if isinstance(o, dict) and o.get("_actual_start_only")
+    ]
+    done_items = [
+        (o, a)
+        for o, a in items
+        if isinstance(o, dict) and o.get("_finished_early") and not o.get("_actual_start_only")
+    ]
+    plan_items = [
+        (o, a)
+        for o, a in items
+        if isinstance(o, dict)
+        and o.get("_plan_updated")
+        and not o.get("_actual_start_only")
+        and not o.get("_finished_early")
+    ]
+    new_items = [
+        (o, a)
+        for o, a in items
+        if isinstance(o, dict)
+        and not o.get("_actual_start_only")
+        and not o.get("_plan_updated")
+        and not o.get("_finished_early")
+    ]
+    msgs: List[str] = []
+    if new_items:
+        msgs.extend(
+            pack_html_messages(
+                _build_notify_blocks(db, new_items),
+                "⚠️ <b>Нові відключення по твоїх адресах:</b>",
+            )
+        )
+    if plan_items:
+        msgs.extend(
+            pack_html_messages(
+                _build_notify_blocks(db, plan_items),
+                "⚠️ <b>Зміна періоду запланованих робіт по твоїх адресах:</b>",
+            )
+        )
+    if done_items:
+        msgs.extend(
+            pack_html_messages(
+                _build_notify_blocks(db, done_items, with_schedule=False),
+                "✅ <b>Роботи по твоїх адресах завершено:</b>",
+            )
+        )
+    if actual_items:
+        msgs.extend(
+            pack_html_messages(
+                _build_notify_blocks(db, actual_items),
+                "ℹ️ <b>Планові роботи по твоїх адресах розпочато:</b>",
+            )
+        )
+    return msgs
 
 
 def _norm_street(name: str) -> str:
@@ -1359,6 +1461,8 @@ def remember_user_notified(col, tid: int, outage: dict, addr: dict) -> None:
             col.delete_one({"_id": f"{int(tid)}:{orig}"})
         except Exception as e:
             log.warning("drop appearance dedup: %s", e)
+    elif outage.get("_actual_start_only"):
+        dkey = actual_start_notify_dedup_key(outage, house)
     else:
         dkey = notify_dedup_key(outage, house)
     otg_raw = addr.get("otg_id") or addr.get("otgId") or 0
@@ -1530,9 +1634,11 @@ def _kyiv_zone():
 
 
 def _to_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_kyiv_zone())
-    return dt.astimezone(timezone.utc)
+    """Цифри з API — київський час, навіть якщо в ISO стоїть +00:00.
+
+    Інакше 18:00+00:00 стає 20:00 за Києвом і після 18:00 план ще «відкритий».
+    """
+    return _kyiv_wall(dt).astimezone(timezone.utc)
 
 
 def plan_still_open(outage: dict, now: Optional[datetime] = None) -> bool:
@@ -1548,6 +1654,23 @@ def plan_still_open(outage: dict, now: Optional[datetime] = None) -> bool:
     elif now.tzinfo is None:
         now = now.replace(tzinfo=_kyiv_zone())
     return _to_utc(end) > now.astimezone(timezone.utc)
+
+
+def _kyiv_wall(dt: datetime) -> datetime:
+    """Годинник з API як київський, навіть якщо в ISO стоїть +00:00."""
+    return dt.replace(tzinfo=None).replace(tzinfo=_kyiv_zone())
+
+
+def kyiv_moment_passed(iso: str, now: Optional[datetime] = None) -> bool:
+    """True, якщо цей момент (як місцевий час ЖОЕ) уже настав."""
+    moment = _parse_iso_dt(iso or "")
+    if moment is None:
+        return False
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_kyiv_zone())
+    return _kyiv_wall(moment).astimezone(timezone.utc) <= now.astimezone(timezone.utc)
 
 
 def period_has_started(outage: dict, now: Optional[datetime] = None) -> bool:
@@ -1804,6 +1927,21 @@ def cancel_notify_dedup_key(outage: dict, house: str = "") -> str:
     return "gone|" + notify_dedup_key(outage, house)
 
 
+def actual_start_notify_dedup_key(outage: dict, house: str = "") -> str:
+    """Окремий ключ: поява фактичного старту не блокується старим «план на 08:00–18:00»."""
+    actual = _fmt_hhmm_from_iso(str(outage.get("_actual_start") or ""))
+    return "actual|" + notify_dedup_key(outage, house) + f"|{actual}"
+
+
+def outage_notify_dedup_key(outage: dict, house: str = "") -> str:
+    """Єдиний вхід для дедупу залежно від типу події."""
+    if outage.get("_cancelled"):
+        return cancel_notify_dedup_key(outage, house)
+    if outage.get("_actual_start_only"):
+        return actual_start_notify_dedup_key(outage, house)
+    return notify_dedup_key(outage, house)
+
+
 def _fetch_pair(
     client: httpx.Client,
     *,
@@ -1839,8 +1977,34 @@ def _fetch_pair(
 
 
 def build_cancel_message(items: List[Tuple[dict, dict]]) -> List[str]:
-    """Окреме сповіщення про зняття. Без блока «світла не буде» — запису вже немає."""
-    header = "✅ <b>Скасовані відключення по твоїх адресах:</b>"
+    """Зняття з API. Без блока «світла не буде» — запису вже немає.
+
+    Якщо період уже почався — окремий заголовок і час проходу скрипта.
+    До старту — «скасовано».
+    """
+    early = [
+        pair for pair in items
+        if isinstance(pair[0], dict) and pair[0].get("_fixed_early")
+    ]
+    rest = [
+        pair for pair in items
+        if not (isinstance(pair[0], dict) and pair[0].get("_fixed_early"))
+    ]
+    msgs: List[str] = []
+    if rest:
+        msgs.extend(_pack_cancel_items(
+            rest,
+            "✅ <b>Скасовані відключення по твоїх адресах:</b>",
+        ))
+    if early:
+        msgs.extend(_pack_cancel_items(
+            early,
+            "✅ <b>Аварійні роботи завершили раніше запланованого періоду по твоїх адресах:</b>",
+        ))
+    return msgs
+
+
+def _pack_cancel_items(items: List[Tuple[dict, dict]], header: str) -> List[str]:
     grouped: List[Tuple[dict, dict]] = []
     group_at: Dict[str, int] = {}
     for outage, addr in items:
@@ -1889,10 +2053,13 @@ def _human_group(rep: dict) -> str:
         (
             rep.get("new"),
             rep.get("plan_upd"),
+            rep.get("finished_early"),
+            rep.get("actual_start"),
             rep.get("gone_early"),
             rep.get("matched"),
             rep.get("cancel_matched"),
             rep.get("unmatched"),
+            rep.get("matched_addrs"),
         )
     )
     if quiet:
@@ -1907,7 +2074,11 @@ def _human_group(rep: dict) -> str:
             f"У відповіді {rep['fetched']} записів, "
             f"для сповіщень {rep['active']}. Адрес підписників: {rep['addrs']}."
         ),
-        f"Нових: {rep['new']}. Оновлень часу: {rep['plan_upd']}.",
+        (
+            f"Нових: {rep['new']}. Оновлень часу: {rep['plan_upd']}. "
+            f"Завершено: {rep.get('finished_early', 0)}. "
+            f"Фактичний старт: {rep.get('actual_start', 0)}."
+        ),
         (
             f"Зникли з видачі: {rep['gone_early']}. "
             f"Скасування підтверджено: {rep.get('cancel_ready', 0)}. "
@@ -1923,6 +2094,11 @@ def _human_group(rep: dict) -> str:
         f"Збіглося з адресами: {rep['matched']}. "
         f"Скасувань у розсилку: {rep['cancel_matched']}."
     )
+    matched_addrs = rep.get("matched_addrs") or []
+    if matched_addrs:
+        lines.append(
+            "Збіг по адресах: " + "; ".join(matched_addrs) + "."
+        )
     if rep.get("covered_skip"):
         lines.append(
             "Не слав скасування, бо цю адресу вже покриває інший запис: "
@@ -2004,7 +2180,11 @@ def main() -> int:
         users = [u for u in users if user_wants(u, "accidents")]
     except Exception as e:
         log.warning("prefs filter failed: %s", e)
-    groups: Dict[Tuple[int, int], List[Tuple[dict, dict]]] = {}
+    # Групуємо по city_id (коли є) — інакше один і той самий населений пункт
+    # з різними otg_id у довіднику (типовий баг ЖОЕ для Коростеня тощо)
+    # дає два однакові звіти. Без city_id — по otg_id.
+    # Ключ: ("c", city_id) | ("o", otg_id)
+    groups: Dict[Tuple[str, int], List[Tuple[dict, dict]]] = {}
     for u in users:
         for addr in get_user_addresses(u):
             if not isinstance(addr, dict):
@@ -2018,10 +2198,13 @@ def main() -> int:
                 city_id = int(city_id) if city_id else 0
             except (TypeError, ValueError):
                 continue
-            groups.setdefault((otg_id, city_id), []).append((u, addr))
+            if city_id:
+                gkey: Tuple[str, int] = ("c", city_id)
+            else:
+                gkey = ("o", otg_id)
+            groups.setdefault(gkey, []).append((u, addr))
 
-    unique_otgs = sorted({otg for otg, _ in groups})
-    log.info("users=%s groups=%s unique_otgs=%s", len(users), len(groups), len(unique_otgs))
+    log.info("users=%s locations=%s", len(users), len(groups))
 
     notified: Dict[int, list] = {}
     cancelled: Dict[int, list] = {}
@@ -2045,7 +2228,7 @@ def main() -> int:
     city_fetch_ok: Dict[int, bool] = {}
     otg_fetch_ok: Dict[int, bool] = {}
 
-    unique_cities = sorted({cid for (_, cid) in groups if cid})
+    unique_cities = sorted({cid for kind, cid in groups if kind == "c"})
     try:
         for city_id in unique_cities:
             items, ok = _fetch_pair(http, city_id=city_id)
@@ -2057,7 +2240,7 @@ def main() -> int:
                 log.error("city=%s fetch failed, cache kept", city_id)
 
         # otg-фетч лише для груп без city_id
-        otgs_without_city = sorted({otg for (otg, cid) in groups if not cid})
+        otgs_without_city = sorted({oid for kind, oid in groups if kind == "o"})
         for otg_id in otgs_without_city:
             items, ok = _fetch_pair(http, otg_id=otg_id)
             otg_outages_cache[otg_id] = items
@@ -2067,13 +2250,35 @@ def main() -> int:
             else:
                 log.error("otg=%s fetch failed, cache kept", otg_id)
 
-        for (otg_id, city_id), group_pairs in groups.items():
-            if city_id:
+        # Сортуємо локації за назвою міста (для звіту в лог-групі)
+        def _group_sort_key(item: Tuple[Tuple[str, int], list]) -> str:
+            gkey, pairs = item
+            name = _group_city_name(pairs, [])
+            return (name or "").lower()
+
+        for gkey, group_pairs in sorted(groups.items(), key=_group_sort_key):
+            kind, loc_id = gkey
+            if kind == "c":
+                city_id = loc_id
+                # otg_id — лише для логів/старих кеш-ключів; fetch уже по city
+                try:
+                    otg_id = int(
+                        (group_pairs[0][1].get("otg_id")
+                         or group_pairs[0][1].get("otgId")
+                         or 0)
+                    )
+                except (TypeError, ValueError, IndexError):
+                    otg_id = 0
                 fetch_ok = bool(city_fetch_ok.get(city_id))
                 outages = list(city_outages_cache.get(city_id) or [])
+                # Кеш знімка — один на city_id (не дробимо по кривому otg)
+                cache_key = f"c_{city_id}"
             else:
+                otg_id = loc_id
+                city_id = 0
                 fetch_ok = bool(otg_fetch_ok.get(otg_id))
                 outages = list(otg_outages_cache.get(otg_id) or [])
+                cache_key = f"o_{otg_id}"
 
             groups_checked += 1
             if not fetch_ok:
@@ -2095,8 +2300,23 @@ def main() -> int:
             current_fps = {content_fingerprint(o) for o in outages}
             current_soft = {soft_fingerprint(o) for o in outages}
 
-            cache_key = f"{otg_id}_{city_id or 0}"
+            # Міграція зі старого ключа otg_city → city/otg
             cache = outages_col.find_one({"_id": cache_key}) or {}
+            if not cache and kind == "c":
+                # спробувати старі ключі з будь-яким otg для цього city
+                for legacy_otg in {
+                    int(a.get("otg_id") or a.get("otgId") or 0)
+                    for _, a in group_pairs
+                    if (a.get("otg_id") or a.get("otgId"))
+                }:
+                    legacy = outages_col.find_one({"_id": f"{legacy_otg}_{city_id}"})
+                    if legacy:
+                        cache = legacy
+                        break
+            elif not cache and kind == "o":
+                legacy = outages_col.find_one({"_id": f"{otg_id}_0"})
+                if legacy:
+                    cache = legacy
             prev_fps = set(cache.get("fps") or [])
             prev_soft = set(cache.get("soft_fps") or [])
 
@@ -2118,6 +2338,8 @@ def main() -> int:
             cur_agg = aggregate_by_addr_day(outages)
             new_outages: list = []
             plan_updates: list = []
+            actual_start_notices: list = []
+            finished_notices: list = []
             seen_adk: set = set()
 
             for adk, agg in cur_agg.items():
@@ -2137,10 +2359,28 @@ def main() -> int:
                     new_outages.append(agg)
                     continue
 
-                # Той самий addr_day: зміна інтервалу → «зміна періоду»
-                if (old_start and cur_start and old_start[:16] != cur_start[:16]) or (
-                    old_end and cur_end and old_end[:16] != cur_end[:16]
-                ):
+                interval_changed = (
+                    (old_start and cur_start and old_start[:16] != cur_start[:16])
+                    or (old_end and cur_end and old_end[:16] != cur_end[:16])
+                )
+
+                shortened = bool(old_end and cur_end and cur_end[:16] < old_end[:16])
+                new_end_passed = shortened and kyiv_moment_passed(cur_end)
+                old_end_passed = shortened and kyiv_moment_passed(old_end)
+
+                if new_end_passed and not old_end_passed:
+                    # 18:00 → 17:00, зараз між 17:00 і 18:00: роботи закінчили раніше плану
+                    oo = dict(agg)
+                    oo["_finished_early"] = True
+                    oo["_was_dateEvent"] = old_start
+                    oo["_was_datePlanIn"] = old_end
+                    finished_notices.append(oo)
+                elif new_end_passed and old_end_passed:
+                    # Обидва кінці вже в минулому (зараз 20:00, було до 18:00, стало до 17:00).
+                    # Задня правка — не «зміна періоду» і не «завершили».
+                    pass
+                elif interval_changed:
+                    # Реальний зсув min(start)/max(end) → «зміна періоду»
                     oo = dict(agg)
                     oo["_plan_updated"] = True
                     oo["_plan_was"] = old_end
@@ -2148,23 +2388,39 @@ def main() -> int:
                     oo["_was_datePlanIn"] = old_end
                     oo["_plan_reason"] = "addr_day_agg"
                     plan_updates.append(oo)
-                # інтервал без змін — мовчки (навіть якщо з’явився новий id)
+                elif agg.get("_actual_start"):
+                    # Інтервал той самий, але з’явився/є фактичний старт з accidents
+                    # (план 08:00–18:00 уже був → окремо кажемо «почали о 09:28»)
+                    oo = dict(agg)
+                    oo["_actual_start_only"] = True
+                    actual_start_notices.append(oo)
+                # інтервал без змін і без фактичного старту — мовчки
 
-            if plan_updates:
-                new_outages = list(new_outages) + plan_updates
+            if plan_updates or actual_start_notices or finished_notices:
+                new_outages = (
+                    list(new_outages) + plan_updates + actual_start_notices + finished_notices
+                )
 
             prev_records = prev_records_early
             gone = select_early_cancellations(prev_records, outages)
             early, pending_gone = apply_cancel_miss_streak(gone)
 
             log.info(
-                "otg=%s city=%s fetched=%s new=%s plan_upd=%s gone_early=%s "
-                "cancel_ready=%s skipped_planned=%s skipped_gpv=%s",
+                "otg=%s city=%s fetched=%s new=%s plan_upd=%s finished=%s actual_start=%s "
+                "gone_early=%s cancel_ready=%s skipped_planned=%s skipped_gpv=%s",
                 otg_id,
                 city_id,
                 len(outages),
-                max(0, len(new_outages) - len(plan_updates)),
+                max(
+                    0,
+                    len(new_outages)
+                    - len(plan_updates)
+                    - len(actual_start_notices)
+                    - len(finished_notices),
+                ),
                 len(plan_updates),
+                len(finished_notices),
+                len(actual_start_notices),
                 len(gone),
                 len(early),
                 skipped_planned,
@@ -2225,6 +2481,8 @@ def main() -> int:
                     log.warning("prune stale outages: %s", e)
 
             matched_fps: set = set()
+            matched_addrs: List[str] = []
+            matched_addrs_seen: set = set()
 
             # --- Per-user нотифікації по АГРЕГОВАНИХ активних відключеннях ---
             # Один логічний інтервал на addr_day — не шлемо окремо план і accident.
@@ -2248,6 +2506,10 @@ def main() -> int:
                     street_name = (addr.get("street_name") or addr.get("street") or "").strip().lower()
                     house = str(addr.get("house") or addr.get("building") or "")
                     uqk = user_queue_key(addr)
+                    addr_label = (
+                        f"{(addr.get('street_name') or addr.get('street') or '?').strip()} "
+                        f"{house}"
+                    ).strip()
 
                     # queue_key на full docs тільки для зматчених адрес
                     if uqk:
@@ -2283,31 +2545,47 @@ def main() -> int:
                         if not matches_building(outage, house):
                             continue
 
-                        dkey = notify_dedup_key(outage, house)
+                        # «Лише фактичний старт» — тільки якщо користувач уже знає
+                        # про цей інтервал (base dedup є). Інакше — повне нове
+                        # сповіщення з рядком «Фактичний старт» у звичайному тексті.
+                        outage_for_user = outage
+                        if outage.get("_actual_start_only"):
+                            base_dkey = notify_dedup_key(outage, house)
+                            if base_dkey not in already_keys:
+                                outage_for_user = dict(outage)
+                                outage_for_user.pop("_actual_start_only", None)
+
+                        dkey = outage_notify_dedup_key(outage_for_user, house)
                         if dkey in already_keys:
                             continue
 
                         # внутрішній дедуп у межах одного прогону
-                        fp = content_fingerprint(outage)
+                        fp = content_fingerprint(outage_for_user)
                         already_run = False
                         for x in notified.get(tid, []):
                             prev_o = x[0] if isinstance(x, tuple) else x
-                            if content_fingerprint(prev_o) == fp:
+                            if content_fingerprint(prev_o) == fp and not (
+                                outage_for_user.get("_actual_start_only")
+                                or prev_o.get("_actual_start_only")
+                            ):
                                 already_run = True
                                 break
-                            if notify_dedup_key(prev_o, house) == dkey:
+                            if outage_notify_dedup_key(prev_o, house) == dkey:
                                 already_run = True
                                 break
                         if already_run:
                             continue
 
-                        outage_copy = dict(outage)
+                        outage_copy = dict(outage_for_user)
                         if uqk:
                             outage_copy["_user_queue"] = uqk
 
                         notified.setdefault(tid, []).append((outage_copy, addr))
                         matched_fps.add(fp)
                         already_keys.add(dkey)
+                        if addr_label and addr_label not in matched_addrs_seen:
+                            matched_addrs_seen.add(addr_label)
+                            matched_addrs.append(addr_label)
 
                 log.info(
                     "otg=%s city=%s matched_active=%s (addrs=%s active=%s)",
@@ -2391,13 +2669,22 @@ def main() -> int:
                 "fetched": len(outages),
                 "active": len(active_outages),
                 "addrs": len(group_pairs),
-                "new": max(0, len(new_outages) - len(plan_updates)),
+                "new": max(
+                    0,
+                    len(new_outages)
+                    - len(plan_updates)
+                    - len(actual_start_notices)
+                    - len(finished_notices),
+                ),
                 "plan_upd": len(plan_updates),
+                "finished_early": len(finished_notices),
+                "actual_start": len(actual_start_notices),
                 "gone_early": len(gone),
                 "cancel_ready": len(early),
                 "skipped_planned": skipped_planned,
                 "skipped_gpv": skipped_gpv,
                 "matched": len(matched_fps),
+                "matched_addrs": matched_addrs,
                 "cancel_matched": matched_cancel,
                 "covered_skip": covered_skip,
                 "unmatched": unmatched,
@@ -2570,7 +2857,8 @@ def main() -> int:
             for tid in tids:
                 new_items = notified.get(tid) or []
                 gone_items = cancelled.get(tid) or []
-                silent = is_quiet_now(_user_by_tid.get(int(tid)))
+                u_doc = _user_by_tid.get(int(tid)) or {}
+                silent = is_quiet_now(u_doc)
                 new_ok = False
                 cancel_ok = False
                 if new_items and await _send_parts(tid, build_notify_message(db, new_items), silent):
@@ -2583,13 +2871,21 @@ def main() -> int:
                         cancel_ok = True
                         _mark(tid, gone_items)
                 mode = "тихо" if silent else "зі звуком"
+                # У повідомленні лог-групи: id + @username (якщо є).
+                # У stdout/GitHub Actions — без персональних даних.
+                uname = (
+                    (u_doc.get("username") or u_doc.get("user_name") or "")
+                    .strip()
+                    .lstrip("@")
+                )
+                who = f"{tid}" + (f" @{uname}" if uname else "")
                 if new_ok or cancel_ok:
                     deliveries.append(
-                        f"{tid} — нові {len(new_items)}, скасування {len(gone_items)}, {mode}"
+                        f"{who} — нові {len(new_items)}, скасування {len(gone_items)}, {mode}"
                     )
                 else:
                     deliveries.append(
-                        f"{tid} — не дійшло (нові {len(new_items)}, скасування {len(gone_items)})"
+                        f"{who} — не дійшло (нові {len(new_items)}, скасування {len(gone_items)})"
                     )
                 if not (new_ok or cancel_ok):
                     continue
@@ -2631,11 +2927,13 @@ def main() -> int:
 
             if log_chat:
                 try:
-                    # 153 — гілка «Аварії, ремонти крон»
+                    # 153 — звичайна гілка «Аварії, ремонти крон»
+                    # 17725 — коли є що розсилати (нові / скасування)
+                    thread_id = 17725 if n_events > 0 else 153
                     await bot.send_message(
                         chat_id=int(log_chat),
                         text=summary,
-                        message_thread_id=153,
+                        message_thread_id=thread_id,
                     )
                     if attachment:
                         doc = BytesIO(attachment.encode("utf-8"))
@@ -2643,7 +2941,7 @@ def main() -> int:
                         await bot.send_document(
                             chat_id=int(log_chat),
                             document=doc,
-                            message_thread_id=153,
+                            message_thread_id=thread_id,
                         )
                 except Exception as e:
                     log.warning("log channel: %s", e)
