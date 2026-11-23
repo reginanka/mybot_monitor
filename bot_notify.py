@@ -432,6 +432,53 @@ def _same_interval(a: Tuple[str, str], b: Tuple[str, str]) -> bool:
     return _interval_key(*a) == _interval_key(*b)
 
 
+def _subtract_intervals(
+    slots: List[Tuple[str, str]],
+    covers: List[Tuple[str, str]],
+) -> List[Tuple[str, str]]:
+    """Частини slots, які не перекриті covers (для «ремонт мінус ГПВ»)."""
+    if not slots:
+        return []
+    if not covers:
+        return _merge_intervals(slots)
+
+    cover_m = []
+    for fr, to in _merge_intervals(covers):
+        a, b = _interval_key(fr, to)
+        if a >= 0 and b > a:
+            cover_m.append((a, b))
+    if not cover_m:
+        return _merge_intervals(slots)
+
+    result_min: List[Tuple[int, int]] = []
+    for fr, to in slots:
+        a, b = _interval_key(fr, to)
+        if a < 0 or b <= a:
+            continue
+        pieces = [(a, b)]
+        for ca, cb in cover_m:
+            nxt: List[Tuple[int, int]] = []
+            for pa, pb in pieces:
+                if cb <= pa or ca >= pb:
+                    nxt.append((pa, pb))
+                    continue
+                if pa < ca:
+                    nxt.append((pa, ca))
+                if cb < pb:
+                    nxt.append((cb, pb))
+            pieces = nxt
+            if not pieces:
+                break
+        result_min.extend(pieces)
+
+    out: List[Tuple[str, str]] = []
+    for a, b in sorted(result_min):
+        if b <= a:
+            continue
+        out.append((_minutes_to_str(a), _minutes_to_str(b)))
+    return _merge_intervals(out)
+
+
 # ---------- data loaders ----------
 
 def load_queue_doc(label: str) -> dict | None:
@@ -611,13 +658,33 @@ def _classify_outage(doc: dict) -> Optional[str]:
     return None
 
 
+def _iso_sort_key(s: str) -> str:
+    """Нормалізує ISO-подібний час для min/max (як у ztoe_outages_monitor)."""
+    s = (s or "").strip().replace(" ", "T")
+    return s[:19] if s else ""
+
+
+def _hhmm_from_iso(s: str) -> str:
+    """Витягує HH:MM з ISO / dateEvent / datePlanIn."""
+    s = _iso_sort_key(s)
+    if len(s) >= 16 and s[10] in ("T", " "):
+        return s[11:16]
+    if len(s) >= 5 and s[2] == ":":
+        return s[:5]
+    return ""
+
+
 def _outages_bucketed(
     addr: dict,
     date_str: str,
 ) -> Dict[str, List[Tuple[str, str]]]:
     """
-    З Mongo outages → {'emergency': [...], 'repair': [...], 'other': [...]}
-    з merge всередині категорії.
+    З Mongo outages → {'emergency': [...], 'repair': [...], 'other': [...]}.
+
+    Логіка періоду як у ztoe_outages_monitor.aggregate_by_addr_day:
+      усі non-GPV записи по цій адресі за день зливаються в ОДИН інтервал
+      min(dateEvent) … max(datePlanIn), а не окремі plan/accident з різними кінцями.
+    Категорія — від представника (пріоритет планового typeOff 0/3).
     """
     empty = {"emergency": [], "repair": [], "other": []}
     try:
@@ -639,14 +706,14 @@ def _outages_bucketed(
     except ValueError:
         ymd = date_str
 
-    buckets: Dict[str, List[Tuple[str, str]]] = {
-        "emergency": [],
-        "repair": [],
-        "other": [],
-    }
     sn = _norm_street(street)
+    members: List[dict] = []
 
-    cursor = db["outages"].find({}).limit(800)
+    # Фільтр по місту зменшує скан; limit — запобіжник.
+    query: dict = {}
+    if city:
+        query["city_name"] = {"$regex": re.escape(city), "$options": "i"}
+    cursor = db["outages"].find(query).limit(2000)
 
     for doc in cursor:
         de = doc.get("dateEvent") or doc.get("date_from") or ""
@@ -689,19 +756,50 @@ def _outages_bucketed(
         if not kind:
             continue
 
-        start_raw = ""
-        end_raw = ""
-        if isinstance(de, str) and len(de) >= 16:
-            start_raw = de[11:16]
-        if isinstance(dp, str) and len(dp) >= 16:
-            end_raw = dp[11:16]
-        if not (start_raw and end_raw):
-            continue
+        members.append(doc)
 
-        buckets[kind].append((start_raw, end_raw))
+    buckets: Dict[str, List[Tuple[str, str]]] = {
+        "emergency": [],
+        "repair": [],
+        "other": [],
+    }
+    if not members:
+        return buckets
 
-    for k in buckets:
-        buckets[k] = _merge_intervals(buckets[k])
+    # --- та сама агрегація, що в кроні: один інтервал на адресу+день ---
+    starts = [
+        _iso_sort_key(m.get("dateEvent") or m.get("date_from") or "")
+        for m in members
+    ]
+    ends = [
+        _iso_sort_key(m.get("datePlanIn") or m.get("date_to") or "")
+        for m in members
+    ]
+    starts = [s for s in starts if s]
+    ends = [e for e in ends if e]
+    if not starts or not ends:
+        return buckets
+
+    start_raw = _hhmm_from_iso(min(starts))
+    end_raw = _hhmm_from_iso(max(ends))
+    if not (start_raw and end_raw):
+        return buckets
+
+    # Представник для категорії: пріоритет планового (typeOff 0/3)
+    rep = None
+    for m in members:
+        try:
+            t = int(m.get("typeOff"))
+        except (TypeError, ValueError):
+            t = -1
+        if t in (0, 3):
+            rep = m
+            break
+    if rep is None:
+        rep = members[0]
+
+    kind = _classify_outage(rep) or "repair"
+    buckets[kind].append((start_raw, end_raw))
     return buckets
 
 
@@ -714,21 +812,16 @@ def _dedupe_by_priority(
     """
     Пріоритет на один інтервал часу:
       погодинні > аварійні > ремонтні > інші
-    Якщо час уже зайнятий вищою категорією — нижчу прибираємо.
+    Нижча категорія лишає лише частини, не покриті вищою
+    (напр. ремонт 08–17 при ГПВ 07–10,13–16 → 10–13,16–17).
     """
     claimed: List[Tuple[str, str]] = list(scheduled)
 
     def take(slots: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        out = []
-        for s in slots:
-            if _interval_covered_by(s, claimed):
-                continue
-            # також точний збіг з уже взятим
-            if any(_same_interval(s, c) for c in claimed):
-                continue
-            out.append(s)
-            claimed.append(s)
-        return _merge_intervals(out)
+        residual = _subtract_intervals(slots, claimed)
+        if residual:
+            claimed.extend(residual)
+        return residual
 
     em = take(emergency)
     rp = take(repair)
@@ -806,7 +899,34 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
         # ЖОЕ ще не передав ГПВ на цей день — не стверджуємо «світло весь день»
         summary = "🔄 Дані очікуємо"
 
-    # Деталі лише якщо є аварійні / ремонтні / інші (не дублюємо чисті ГПВ)
+    has_scheduled = bool(scheduled)
+    has_extra = bool(emerg or repair or other)
+
+    # Черга без адреси або лише ГПВ — підсумок у цитаті, без «Деталі»
+    if addr.get("queue_only") or (has_scheduled and not has_extra) or not has_extra:
+        return f"{head}\n<blockquote>{summary}</blockquote>"
+
+    # Лише ремонт/аварія (без погодинних) — компактний тег
+    if not has_scheduled and has_extra:
+        tags: List[str] = []
+        if emerg:
+            tags.append("⚠️Аварія")
+        if repair:
+            tags.append("🛠Ремонт")
+        if other and not emerg and not repair:
+            tags.append("⚪Інше")
+        tag = f" ({' '.join(tags)})" if tags else ""
+        # summary тут з префіксом «Світла не буде» — для компакту лишаємо час окремо
+        if all_merged:
+            ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
+            compact = (
+                f"<u>{ranges}</u> "
+                f"({_fmt_duration(_total_minutes(all_merged))}){tag}"
+            )
+        else:
+            compact = summary + tag
+        return f"{head}\n<blockquote>{compact}</blockquote>"
+
     extra_lines = []
     if emerg:
         extra_lines.append(_format_slots_line("⚠️ Аварійні", emerg))
@@ -814,10 +934,6 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
         extra_lines.append(_format_slots_line("🛠 Ремонтні", repair))
     if other:
         extra_lines.append(_format_slots_line("⚪ Інші", other))
-
-    # Черга без адреси або лише ГПВ — підсумок у цитаті, без «Деталі»
-    if addr.get("queue_only") or not extra_lines:
-        return f"{head}\n<blockquote>{summary}</blockquote>"
 
     detail = [summary, "⬇️⬇️⬇️", "Деталі:"]
     if scheduled:
@@ -986,13 +1102,37 @@ def _outage_under_header(
 ) -> str:
     """
     Під заголовком «Світла не буде по адресах»:
-      адреса + звичайна цитата (лише ГПВ)
-      або expandable з Деталями (ремонт/аварія).
+
+    • лише ГПВ → адреса + інтервали
+    • лише ремонт/аварія (без ГПВ) → компактно:
+        08:00-17:00 (9 год) (🛠Ремонт)
+    • ГПВ + ремонт/аварія → expandable з Деталями;
+      у деталях ремонт уже «мінус ГПВ» (після _dedupe_by_priority)
     """
     head = _addr_head_line(lab, addr)
     ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
     summary = f"<u>{ranges}</u> ({_fmt_duration(_total_minutes(all_merged))})"
 
+    has_scheduled = bool(scheduled)
+    has_extra = bool(emerg or repair or other)
+
+    # Лише ГПВ — без деталей
+    if has_scheduled and not has_extra:
+        return f"{head}\n<blockquote>{summary}</blockquote>"
+
+    # Лише ремонт / аварія / інше (немає погодинних) — компактний тег у тому ж рядку
+    if not has_scheduled and has_extra:
+        tags: List[str] = []
+        if emerg:
+            tags.append("⚠️Аварія")
+        if repair:
+            tags.append("🛠Ремонт")
+        if other and not emerg and not repair:
+            tags.append("⚪Інше")
+        tag = f" ({' '.join(tags)})" if tags else ""
+        return f"{head}\n<blockquote>{summary}{tag}</blockquote>"
+
+    # Змішано: ГПВ + ремонт/аварія — розгорнуті деталі
     extra_lines = []
     if emerg:
         extra_lines.append(_format_slots_line("⚠️ Аварійні", emerg))
@@ -1000,9 +1140,6 @@ def _outage_under_header(
         extra_lines.append(_format_slots_line("🛠 Ремонтні", repair))
     if other:
         extra_lines.append(_format_slots_line("⚪ Інші", other))
-
-    if not extra_lines:
-        return f"{head}\n<blockquote>{summary}</blockquote>"
 
     detail = [summary, "⬇️⬇️⬇️", "Деталі:"]
     if scheduled:
