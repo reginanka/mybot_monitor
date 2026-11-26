@@ -1114,8 +1114,43 @@ def format_schedule_block_for_notify(
 
 
 TG_TEXT_LIMIT = 4096
+# Rich Messages (sendRichMessage): до 32768 UTF-8 символів, до 500 блоків.
+RICH_MSG_LIMIT = 32768
+
+
+async def send_rich_html(
+    bot_token: str,
+    chat_id: int,
+    html_body: str,
+    *,
+    message_thread_id: int | None = None,
+    disable_notification: bool = False,
+) -> dict:
+    """Telegram Bot API 10.1+ sendRichMessage (таблиці / rich HTML).
+
+    Звичайний sendMessage + parse_mode=HTML таблиць НЕ підтримує —
+    саме через це лог приходив «обрізаним» plain-fallback.
+    """
+    payload: dict = {
+        "chat_id": chat_id,
+        "rich_message": {"html": html_body},
+    }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = int(message_thread_id)
+    if disable_notification:
+        payload["disable_notification"] = True
+    url = f"https://api.telegram.org/bot{bot_token}/sendRichMessage"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=payload)
+        data = r.json()
+        if not data.get("ok"):
+            desc = data.get("description") or r.text
+            raise RuntimeError(f"sendRichMessage failed: {desc}")
+        return data
+
+
 _HTML_TAG_RE = re.compile(
-    r"<(/?)(blockquote|b|u|s|i|code|pre|a|tg-spoiler)\b[^>]*>",
+    r"<(/?)(blockquote|b|u|s|i|code|pre|a|tg-spoiler|table|caption|tr|th|td)\b[^>]*>",
     re.IGNORECASE,
 )
 
@@ -2140,75 +2175,110 @@ def _group_city_name(group_pairs, outages) -> str:
     return ""
 
 
-def _human_group(rep: dict) -> str:
-    title = (rep.get("city_name") or "").strip() or f"місто {rep.get('city_id')}"
+def _group_has_signal(rep: dict) -> bool:
+    """Локація з реальними подіями/змінами (не лише «немає на адресах»)."""
     if not rep.get("fetch_ok"):
-        return (
-            f"• {title}: ЖОЕ не відповіло, кеш не змінював. "
-            f"Адрес підписників: {rep.get('addrs', 0)}."
-        )
-    quiet = not any(
-        (
-            rep.get("new"),
-            rep.get("plan_upd"),
-            rep.get("finished_early"),
-            rep.get("actual_start"),
-            rep.get("gone_early"),
-            rep.get("matched"),
-            rep.get("cancel_matched"),
-            rep.get("unmatched"),
-            rep.get("matched_addrs"),
-        )
+        return True
+    return bool(
+        rep.get("new")
+        or rep.get("plan_upd")
+        or rep.get("finished_early")
+        or rep.get("actual_start")
+        or rep.get("gone_early")
+        or rep.get("matched")
+        or rep.get("cancel_matched")
+        or rep.get("matched_addrs")
     )
-    if quiet:
-        return (
-            f"• {title}: без змін. "
-            f"Записів у відповіді {rep['fetched']}, адрес {rep['addrs']}."
-        )
-    waiting = max(0, int(rep.get("gone_early") or 0) - int(rep.get("cancel_ready") or 0))
-    lines = [
-        f"• {title}",
-        (
-            f"У відповіді {rep['fetched']} записів, "
-            f"для сповіщень {rep['active']}. Адрес підписників: {rep['addrs']}."
-        ),
-        (
-            f"Нових: {rep['new']}. Оновлень часу: {rep['plan_upd']}. "
-            f"Завершено: {rep.get('finished_early', 0)}. "
-            f"Фактичний старт: {rep.get('actual_start', 0)}."
-        ),
-        (
-            f"Зникли з видачі: {rep['gone_early']}. "
-            f"Скасування підтверджено: {rep.get('cancel_ready', 0)}. "
-            f"Ще чекають повторної перевірки: {waiting}."
-        ),
-    ]
-    if rep.get("skipped_planned") or rep.get("skipped_gpv"):
-        lines.append(
-            f"Пропущено вже відомих планових: {rep['skipped_planned']}, "
-            f"погодинних графіків: {rep['skipped_gpv']}."
-        )
-    lines.append(
-        f"Збіглося з адресами: {rep['matched']}. "
-        f"Скасувань у розсилку: {rep['cancel_matched']}."
+
+
+def _td(val, *, align: str | None = None) -> str:
+    """Комірка таблиці. Без вкладених тегів усередині — safer для Rich HTML."""
+    s = html.escape(str(val))
+    if align in ("left", "right", "center"):
+        return f'<td align="{align}">{s}</td>'
+    return f"<td>{s}</td>"
+
+
+def _th(val, *, align: str = "left") -> str:
+    s = html.escape(str(val))
+    return f'<th align="{align}">{s}</th>'
+
+
+def _log_legend_html() -> str:
+    """Легенда скорочень у таблицях логу (згортається через details)."""
+    return (
+        "<details>"
+        "<summary>📖 Легенда позначок</summary>"
+        "<p>"
+        "<b>Підсумок:</b> У розсилку — події, які пішли підписникам; "
+        "Нових / Скасувань — окремо; Отримали — скільки людей реально прийняли повідомлення; "
+        "Зі звуком / тихо — з урахуванням quiet hours.<br/>"
+        "<b>Локації з подіями:</b><br/>"
+        "• <b>API</b> — скільки записів повернув ЖОЕ (аварії + плани)<br/>"
+        "• <b>Акт</b> — активних non-ГПВ інтервалів після агрегації по адресі+дню<br/>"
+        "• <b>Нов</b> — нові addr_day (ще не було в знімку)<br/>"
+        "• <b>Змін</b> — зміна періоду (min start / max end)<br/>"
+        "• <b>Fin</b> — кінець урізали і новий кінець уже минув (роботи завершили раніше)<br/>"
+        "• <b>Старт</b> — фактичний старт робіт (пізніший start з accidents)<br/>"
+        "• <b>Зник</b> — записи зникли з API до кінця плану (кандидати на скасування)<br/>"
+        "• <b>Скас</b> — скасування підтверджено (після CANCEL_MISS_RUNS пропусків)<br/>"
+        "• <b>Чек</b> — ще чекають повторної перевірки (miss &lt; порогу)<br/>"
+        "• <b>Збіг</b> — скільки активних подій збіглися з адресами підписників<br/>"
+        "• <b>→Ск</b> — скасувань, що пішли в розсилку конкретному підписнику<br/>"
+        "<b>Деталі:</b> збіг / покрито / пропущено — пояснення по конкретних адресах."
+        "</p>"
+        "</details>"
     )
-    matched_addrs = rep.get("matched_addrs") or []
-    if matched_addrs:
-        lines.append(
-            "Збіг по адресах: " + "; ".join(matched_addrs) + "."
-        )
-    if rep.get("covered_skip"):
-        lines.append(
-            "Не слав скасування, бо цю адресу вже покриває інший запис: "
-            f"{rep['covered_skip']}."
-        )
-    if rep.get("unmatched"):
-        lines.append(
-            "Зараз відключень на цих адресах немає: "
-            + "; ".join(rep["unmatched"])
-            + "."
-        )
-    return "\n".join(lines)
+
+
+def _pack_rich_parts(parts: List[str], limit: int = RICH_MSG_LIMIT) -> List[str]:
+    """Складає HTML-блоки логу в кілька rich-повідомлень ≤ limit.
+
+    Не обрізає і не кидає в .txt: при переповненні — нове повідомлення
+    з міткою «Продовження».
+    """
+    if not parts:
+        return []
+    msgs: List[str] = []
+    cur = ""
+    cont = "⚠️ <b>Продовження звіту:</b>"
+    for part in parts:
+        part = (part or "").strip()
+        if not part:
+            continue
+        # Один блок більший за ліміт — рідко (дуже довгий список адрес); ріжемо по рядках
+        if len(part) > limit:
+            if cur:
+                msgs.append(cur)
+                cur = ""
+            # розбити на шматки з запасом
+            chunk_budget = max(1000, limit - 80)
+            buf = ""
+            for line in part.split("\n"):
+                cand = line if not buf else buf + "\n" + line
+                if buf and len(cand) > chunk_budget:
+                    piece = buf if not msgs and not cur else f"{cont}\n\n{buf}"
+                    msgs.append(piece)
+                    buf = line
+                else:
+                    buf = cand
+            if buf:
+                piece = buf if not msgs else f"{cont}\n\n{buf}"
+                msgs.append(piece)
+            continue
+        sep = "\n\n" if cur else ""
+        candidate = f"{cur}{sep}{part}" if cur else part
+        if cur and len(candidate) > limit:
+            msgs.append(cur)
+            cur = f"{cont}\n\n{part}"
+            if len(cur) > limit:
+                msgs.append(cur)
+                cur = ""
+        else:
+            cur = candidate
+    if cur:
+        msgs.append(cur)
+    return msgs
 
 
 def _human_run_summary(
@@ -2223,35 +2293,195 @@ def _human_run_summary(
     sent_sound: int,
     sent_quiet: int,
     deliveries: Optional[List[str]] = None,
-) -> str:
-    body = "\n\n".join(_human_group(rep) for rep in reports) or "Груп немає."
-    who = ""
+) -> List[str]:
+    """Звіт у лог-групу через Telegram Rich HTML (sendRichMessage).
+
+    Тихі локації без сигналу — не додаємо.
+    Ліміт RICH_MSG_LIMIT (32768): при перевищенні ділимо на кілька
+    повідомлень, без .txt-вкладення.
+    """
+    signal_reps: List[dict] = []
+    fail_reps: List[dict] = []
+    quiet_n = 0
+    for rep in reports:
+        if not rep.get("fetch_ok"):
+            fail_reps.append(rep)
+            continue
+        if not _group_has_signal(rep):
+            quiet_n += 1
+            continue
+        signal_reps.append(rep)
+
+    header = (
+        "✅ <b>Перевірка відключень</b>\n"
+        f"Підписників: <b>{users}</b> · Локацій: <b>{groups_checked}</b>"
+        f" (з подіями: <b>{len(signal_reps)}</b>"
+        + (f", без змін: {quiet_n}" if quiet_n else "")
+        + ")"
+    )
+
+    parts: List[str] = [header]
+
+    parts.append(
+        "<table bordered striped>"
+        "<caption>Підсумок</caption>"
+        "<tr>"
+        f"{_th('Показник')}{_th('Значення', align='right')}"
+        "</tr>"
+        "<tr>"
+        f"{_td('У розсилку', align='left')}{_td(n_events)}"
+        "</tr>"
+        "<tr>"
+        f"{_td('Нових', align='left')}{_td(n_new)}"
+        "</tr>"
+        "<tr>"
+        f"{_td('Скасувань', align='left')}{_td(n_cancels)}"
+        "</tr>"
+        "<tr>"
+        f"{_td('Отримали', align='left')}{_td(sent)}"
+        "</tr>"
+        "<tr>"
+        f"{_td('Зі звуком / тихо', align='left')}{_td(f'{sent_sound} / {sent_quiet}')}"
+        "</tr>"
+        "</table>"
+    )
+
+    if fail_reps:
+        fail_rows = []
+        for rep in fail_reps:
+            title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+            fail_rows.append(
+                "<tr>"
+                f"{_td(title, align='left')}"
+                f"{_td(rep.get('addrs', 0))}"
+                "</tr>"
+            )
+        parts.append(
+            "<table bordered striped>"
+            "<caption>⚠️ ЖОЕ не відповіло</caption>"
+            "<tr>"
+            f"{_th('Місто')}{_th('Адрес', align='right')}"
+            "</tr>"
+            + "".join(fail_rows)
+            + "</table>"
+        )
+
+    if signal_reps:
+        rows = []
+        for rep in signal_reps:
+            title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+            waiting = max(
+                0,
+                int(rep.get("gone_early") or 0) - int(rep.get("cancel_ready") or 0),
+            )
+            rows.append(
+                "<tr>"
+                f"{_td(title, align='left')}"
+                f"{_td(rep.get('fetched', 0))}"
+                f"{_td(rep.get('active', 0))}"
+                f"{_td(rep.get('new', 0))}"
+                f"{_td(rep.get('plan_upd', 0))}"
+                f"{_td(rep.get('finished_early', 0))}"
+                f"{_td(rep.get('actual_start', 0))}"
+                f"{_td(rep.get('gone_early', 0))}"
+                f"{_td(rep.get('cancel_ready', 0))}"
+                f"{_td(waiting)}"
+                f"{_td(rep.get('matched', 0))}"
+                f"{_td(rep.get('cancel_matched', 0))}"
+                "</tr>"
+            )
+        parts.append(
+            "<table bordered striped>"
+            "<caption>Локації з подіями</caption>"
+            "<tr>"
+            f"{_th('Місто')}"
+            f"{_th('API', align='right')}"
+            f"{_th('Акт', align='right')}"
+            f"{_th('Нов', align='right')}"
+            f"{_th('Змін', align='right')}"
+            f"{_th('Fin', align='right')}"
+            f"{_th('Старт', align='right')}"
+            f"{_th('Зник', align='right')}"
+            f"{_th('Скас', align='right')}"
+            f"{_th('Чек', align='right')}"
+            f"{_th('Збіг', align='right')}"
+            f"{_th('→Ск', align='right')}"
+            "</tr>"
+            + "".join(rows)
+            + "</table>"
+        )
+
+        detail_rows = []
+        for rep in signal_reps:
+            title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+            matched_addrs = rep.get("matched_addrs") or []
+            if matched_addrs:
+                detail_rows.append(
+                    "<tr>"
+                    f"{_td(title, align='left')}"
+                    f"{_td('збіг', align='left')}"
+                    f"{_td('; '.join(matched_addrs), align='left')}"
+                    "</tr>"
+                )
+            if rep.get("covered_skip"):
+                detail_rows.append(
+                    "<tr>"
+                    f"{_td(title, align='left')}"
+                    f"{_td('покрито', align='left')}"
+                    f"{_td(rep['covered_skip'])}"
+                    "</tr>"
+                )
+            if rep.get("skipped_planned") or rep.get("skipped_gpv"):
+                skip_txt = (
+                    f"план {rep.get('skipped_planned', 0)}, "
+                    f"ГПВ {rep.get('skipped_gpv', 0)}"
+                )
+                detail_rows.append(
+                    "<tr>"
+                    f"{_td(title, align='left')}"
+                    f"{_td('пропущено', align='left')}"
+                    f"{_td(skip_txt, align='left')}"
+                    "</tr>"
+                )
+        if detail_rows:
+            parts.append(
+                "<table bordered striped>"
+                "<caption>Деталі</caption>"
+                "<tr>"
+                f"{_th('Місто')}{_th('Тип')}{_th('Значення')}"
+                "</tr>"
+                + "".join(detail_rows)
+                + "</table>"
+            )
+    elif not fail_reps:
+        parts.append("<i>Немає локацій з подіями.</i>")
+
     if deliveries:
-        who = "Кому надіслано:\n" + "\n".join(deliveries)
-    text = (
-        "✅ Перевірка відключень\n"
-        f"Підписників: {users}. Локацій: {groups_checked}.\n\n"
-        f"{body}\n\n"
-        f"У розсилку пішло {n_events}: нових {n_new}, скасувань {n_cancels}.\n"
-        f"Повідомлення отримали {sent} "
-        f"(зі звуком {sent_sound}, тихо {sent_quiet})."
-    )
-    if who:
-        text = text.rstrip() + "\n\n" + who
-    if len(text) <= TG_TEXT_LIMIT:
-        return text, None
-    short = (
-        "✅ Перевірка відключень\n"
-        f"Підписників: {users}. Локацій: {groups_checked}.\n"
-        f"У розсилку пішло {n_events}: нових {n_new}, скасувань {n_cancels}.\n"
-        f"Повідомлення отримали {sent} "
-        f"(зі звуком {sent_sound}, тихо {sent_quiet}).\n\n"
-        "Детальний звіт у файлі.\n\n"
-        + (who or "Кому надіслано:\nнемає")
-    )
-    if len(short) > TG_TEXT_LIMIT:
-        short = short[: TG_TEXT_LIMIT - 20].rstrip() + "\n… решта у файлі"
-    return short, text
+        d_rows = []
+        for d in deliveries:
+            if " — " in d:
+                who, rest = d.split(" — ", 1)
+            else:
+                who, rest = d, ""
+            d_rows.append(
+                "<tr>"
+                f"{_td(who.strip(), align='left')}"
+                f"{_td(rest.strip(), align='left')}"
+                "</tr>"
+            )
+        parts.append(
+            "<table bordered striped>"
+            "<caption>Кому надіслано</caption>"
+            "<tr>"
+            f"{_th('Кому')}{_th('Нові / Скас / Режим')}"
+            "</tr>"
+            + "".join(d_rows)
+            + "</table>"
+        )
+
+    parts.append(_log_legend_html())
+    return _pack_rich_parts(parts, RICH_MSG_LIMIT)
+
 
 
 def main() -> int:
@@ -3011,7 +3241,7 @@ def main() -> int:
                 )
                 await asyncio.sleep(0.35)
 
-            summary, attachment = _human_run_summary(
+            log_msgs = _human_run_summary(
                 group_reports,
                 users=len(users),
                 groups_checked=groups_checked,
@@ -3024,35 +3254,59 @@ def main() -> int:
                 deliveries=deliveries,
             )
             log.info(
-                "підсумок subscribers=%s locations=%s events=%s sent=%s sound=%s quiet=%s",
+                "підсумок subscribers=%s locations=%s events=%s sent=%s sound=%s quiet=%s log_parts=%s",
                 len(users),
                 groups_checked,
                 n_events,
                 sent,
                 sent_sound,
                 sent_quiet,
+                len(log_msgs),
             )
 
             if log_chat:
-                try:
-                    # 153 — звичайна гілка «Аварії, ремонти крон»
-                    # 17725 — коли є що розсилати (нові / скасування)
-                    thread_id = 17725 if n_events > 0 else 153
-                    await bot.send_message(
-                        chat_id=int(log_chat),
-                        text=summary,
-                        message_thread_id=thread_id,
-                    )
-                    if attachment:
-                        doc = BytesIO(attachment.encode("utf-8"))
-                        doc.name = "outages-log.txt"
-                        await bot.send_document(
-                            chat_id=int(log_chat),
-                            document=doc,
+                # 153 — звичайна гілка «Аварії, ремонти крон»
+                # 17725 — коли є що розсилати (нові / скасування)
+                thread_id = 17725 if n_events > 0 else 153
+                chat_id = int(log_chat)
+                for part_i, log_html in enumerate(log_msgs):
+                    try:
+                        # Таблиці — лише sendRichMessage (Bot API 10.1+).
+                        # Ліміт 32768; кілька частин замість .txt.
+                        await send_rich_html(
+                            bot_token,
+                            chat_id,
+                            log_html,
                             message_thread_id=thread_id,
                         )
-                except Exception as e:
-                    log.warning("log channel: %s", e)
+                    except Exception as e:
+                        log.warning(
+                            "log channel rich fail part=%s/%s thread=%s len=%s: %s",
+                            part_i + 1,
+                            len(log_msgs),
+                            thread_id,
+                            len(log_html or ""),
+                            e,
+                        )
+                        if part_i == 0:
+                            try:
+                                plain = (
+                                    "✅ Перевірка відключень\n"
+                                    f"Підписників: {len(users)} · Локацій: {groups_checked}\n"
+                                    f"У розсилку: {n_events} (нових {n_new}, скасувань {n_cancels})\n"
+                                    f"Отримали: {sent} (звук {sent_sound}, тихо {sent_quiet})\n"
+                                    "(rich message не прийнято — див. Actions log)"
+                                )
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=plain,
+                                    disable_web_page_preview=True,
+                                    message_thread_id=thread_id,
+                                )
+                            except Exception as e2:
+                                log.warning("log channel plain fail: %s", e2)
+                    if part_i + 1 < len(log_msgs):
+                        await asyncio.sleep(0.35)
         finally:
             await bot.shutdown()
 
